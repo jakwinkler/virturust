@@ -72,8 +72,10 @@ uninstall:
 	@echo "  sudo rm -rf /var/lib/corten"
 
 ## Run smoke tests (needs root + network + pulled images)
-smoke-test: build
-	sudo ./scripts/smoke-test.sh
+## Usage: sudo make smoke-test  (or build first with 'make build', then 'sudo ./scripts/smoke-test.sh')
+smoke-test:
+	@if [ ! -f target/release/corten ]; then echo "Run 'make build' first (as your user, not root)"; exit 1; fi
+	./scripts/smoke-test.sh
 
 ## Build Docker image for testing
 docker:
