@@ -419,35 +419,60 @@ pub fn setup_port_forwarding(
     container_ip: &str,
     ports: &[crate::config::PortMapping],
 ) -> Result<()> {
+    let has_firewalld = Command::new("firewall-cmd")
+        .arg("--state")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
     for port in ports {
         let dport = port.host_port.to_string();
         let to_dest = format!("{container_ip}:{}", port.container_port);
 
-        run_cmd(
-            "iptables",
-            &[
-                "-t", "nat", "-A", "PREROUTING",
-                "-d", &port.host_ip,
-                "-p", "tcp", "--dport", &dport,
-                "-j", "DNAT", "--to-destination", &to_dest,
-            ],
-        )
-        .with_context(|| format!(
-            "failed to add DNAT rule for {}:{} -> {}:{}",
-            port.host_ip, port.host_port, container_ip, port.container_port
-        ))?;
+        if has_firewalld {
+            // Use firewalld for port forwarding
+            let fwd = format!(
+                "port={}:proto=tcp:toaddr={}:toport={}",
+                port.host_port, container_ip, port.container_port
+            );
+            run_cmd("firewall-cmd", &["--zone=trusted", &format!("--add-forward-port={fwd}")])
+                .with_context(|| format!("firewalld forward port failed: {fwd}"))?;
 
-        // Also add rule for locally-originated traffic (OUTPUT chain)
-        run_cmd(
-            "iptables",
-            &[
-                "-t", "nat", "-A", "OUTPUT",
-                "-d", &port.host_ip,
-                "-p", "tcp", "--dport", &dport,
-                "-j", "DNAT", "--to-destination", &to_dest,
-            ],
-        )
-        .ok(); // Best-effort for local traffic
+            // Also allow direct access from the host itself
+            run_cmd(
+                "iptables",
+                &[
+                    "-t", "nat", "-A", "OUTPUT",
+                    "-p", "tcp", "--dport", &dport,
+                    "-j", "DNAT", "--to-destination", &to_dest,
+                ],
+            )
+            .ok();
+        } else {
+            // Use iptables directly
+            run_cmd(
+                "iptables",
+                &[
+                    "-t", "nat", "-A", "PREROUTING",
+                    "-p", "tcp", "--dport", &dport,
+                    "-j", "DNAT", "--to-destination", &to_dest,
+                ],
+            )
+            .with_context(|| format!(
+                "failed to add DNAT rule for {}:{} -> {}:{}",
+                port.host_ip, port.host_port, container_ip, port.container_port
+            ))?;
+
+            run_cmd(
+                "iptables",
+                &[
+                    "-t", "nat", "-A", "OUTPUT",
+                    "-p", "tcp", "--dport", &dport,
+                    "-j", "DNAT", "--to-destination", &to_dest,
+                ],
+            )
+            .ok();
+        }
 
         log::info!(
             "port forwarding: {}:{} -> {}:{}",
@@ -462,16 +487,29 @@ pub fn cleanup_port_forwarding(
     container_ip: &str,
     ports: &[crate::config::PortMapping],
 ) -> Result<()> {
+    let has_firewalld = Command::new("firewall-cmd")
+        .arg("--state")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
     for port in ports {
         let dport = port.host_port.to_string();
         let to_dest = format!("{container_ip}:{}", port.container_port);
 
-        // Remove PREROUTING rule
+        if has_firewalld {
+            let fwd = format!(
+                "port={}:proto=tcp:toaddr={}:toport={}",
+                port.host_port, container_ip, port.container_port
+            );
+            run_cmd("firewall-cmd", &["--zone=trusted", &format!("--remove-forward-port={fwd}")]).ok();
+        }
+
+        // Remove iptables rules (best-effort, may not exist)
         run_cmd(
             "iptables",
             &[
                 "-t", "nat", "-D", "PREROUTING",
-                "-d", &port.host_ip,
                 "-p", "tcp", "--dport", &dport,
                 "-j", "DNAT", "--to-destination", &to_dest,
             ],
