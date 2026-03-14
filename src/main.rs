@@ -41,6 +41,7 @@ async fn main() -> Result<()> {
         Commands::Stats(args) => cmd_stats(args)?,
         Commands::Kill(args) => cmd_kill(args)?,
         Commands::Cp(args) => cmd_cp(args)?,
+        Commands::Compose(args) => cmd_compose(args).await?,
     }
 
     Ok(())
@@ -803,5 +804,218 @@ fn cmd_system_prune() -> Result<()> {
 
     // Then prune images
     cmd_image_prune()?;
+    Ok(())
+}
+
+async fn cmd_compose(args: corten::cli::ComposeArgs) -> Result<()> {
+    use corten::compose;
+    use corten::cli::ComposeCommands;
+
+    let compose_path = std::path::Path::new(&args.file);
+
+    match args.command {
+        ComposeCommands::Up(_up_args) => {
+            require_privileges()?;
+
+            if !compose_path.exists() {
+                return Err(anyhow!("compose file not found: {}", compose_path.display()));
+            }
+
+            let comp = compose::parse_compose_file(compose_path)?;
+            let order = compose::resolve_order(&comp)?;
+
+            println!("Starting {} services...", comp.services.len());
+            compose::print_compose_summary(&comp);
+            println!();
+
+            // Create project network
+            let project_name = compose_path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("corten");
+            let net_name = format!("{project_name}_default");
+            corten::network::create_network(&net_name).ok(); // ignore if exists
+
+            // Start services in dependency order
+            for svc_name in &order {
+                let svc = &comp.services[svc_name];
+                let image = svc.image.as_deref().unwrap_or("alpine");
+                let (img_name, img_tag) = corten::config::parse_image_ref(image);
+
+                // Auto-pull if needed
+                if !corten::image::image_exists(img_name, img_tag) {
+                    println!("Pulling {image}...");
+                    corten::image::pull_image(img_name, img_tag).await?;
+                }
+
+                let container_name = svc.container_name.clone()
+                    .unwrap_or_else(|| format!("{project_name}-{svc_name}"));
+
+                let rootfs = corten::image::image_rootfs(img_name, img_tag);
+                let img_config = corten::image::load_image_config(img_name, img_tag);
+
+                let command = svc.command.clone()
+                    .or_else(|| if !img_config.cmd.is_empty() { Some(img_config.cmd.clone()) } else { None })
+                    .unwrap_or_else(|| vec!["/bin/sh".to_string()]);
+
+                let memory_bytes = svc.deploy.as_ref()
+                    .and_then(|d| d.resources.as_ref())
+                    .and_then(|r| r.limits.as_ref())
+                    .and_then(|l| l.memory.as_ref())
+                    .map(|m| corten::config::parse_memory(m))
+                    .transpose()?;
+
+                let cpu_quota = svc.deploy.as_ref()
+                    .and_then(|d| d.resources.as_ref())
+                    .and_then(|r| r.limits.as_ref())
+                    .and_then(|l| l.cpus.as_ref())
+                    .and_then(|c| c.parse::<f64>().ok());
+
+                let volumes = svc.volumes.iter()
+                    .map(|v| corten::config::parse_volume(v))
+                    .collect::<Result<Vec<_>>>()?;
+
+                let ports = svc.ports.iter()
+                    .map(|p| corten::config::parse_port(p))
+                    .collect::<Result<Vec<_>>>()?;
+
+                let id = uuid::Uuid::new_v4().to_string();
+
+                let cfg = config::ContainerConfig {
+                    id,
+                    name: container_name.clone(),
+                    image: image.to_string(),
+                    command,
+                    hostname: svc.hostname.clone().unwrap_or_else(|| svc_name.clone()),
+                    resources: config::ResourceLimits {
+                        memory_bytes,
+                        cpu_quota,
+                        pids_max: None,
+                    },
+                    rootfs,
+                    volumes,
+                    env: {
+                        let mut env = img_config.env;
+                        env.extend(svc.environment.clone());
+                        env
+                    },
+                    working_dir: svc.working_dir.clone().unwrap_or(img_config.working_dir),
+                    user: svc.user.clone().unwrap_or(img_config.user),
+                    network_mode: if !svc.networks.is_empty() {
+                        svc.networks[0].clone()
+                    } else {
+                        net_name.clone()
+                    },
+                    ports,
+                    restart_policy: svc.restart.clone().unwrap_or_else(|| "no".to_string()),
+                    rootless: false,
+                    privileged: svc.privileged,
+                    read_only: svc.read_only,
+                    auto_remove: false,
+                };
+
+                println!("  Starting {svc_name} ({image})...");
+                container::run(&cfg, true)?;
+                println!("  Started {container_name}");
+            }
+
+            println!("\nAll services started.");
+        }
+
+        ComposeCommands::Down => {
+            require_privileges()?;
+
+            if !compose_path.exists() {
+                return Err(anyhow!("compose file not found: {}", compose_path.display()));
+            }
+
+            let comp = compose::parse_compose_file(compose_path)?;
+            let order = compose::resolve_order(&comp)?;
+
+            let project_name = compose_path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("corten");
+
+            // Stop in reverse dependency order
+            for svc_name in order.iter().rev() {
+                let container_name = comp.services[svc_name].container_name.clone()
+                    .unwrap_or_else(|| format!("{project_name}-{svc_name}"));
+
+                if let Ok(dir) = container::find_container(&container_name) {
+                    println!("  Stopping {container_name}...");
+                    container::stop(&dir, 10).ok();
+                    std::fs::remove_dir_all(&dir).ok();
+                    println!("  Removed {container_name}");
+                }
+            }
+
+            // Remove project network
+            let net_name = format!("{project_name}_default");
+            corten::network::remove_network(&net_name).ok();
+
+            println!("All services stopped and removed.");
+        }
+
+        ComposeCommands::Ps => {
+            if !compose_path.exists() {
+                return Err(anyhow!("compose file not found: {}", compose_path.display()));
+            }
+
+            let comp = compose::parse_compose_file(compose_path)?;
+            let project_name = compose_path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("corten");
+
+            println!("{:<20} {:<15} {:<10}", "SERVICE", "CONTAINER", "STATUS");
+            println!("{}", "-".repeat(50));
+
+            for svc_name in comp.services.keys() {
+                let container_name = comp.services[svc_name].container_name.clone()
+                    .unwrap_or_else(|| format!("{project_name}-{svc_name}"));
+
+                let status = if let Ok(dir) = container::find_container(&container_name) {
+                    if let Ok(state) = container::load_state(&dir) {
+                        state.status.to_string()
+                    } else {
+                        "unknown".to_string()
+                    }
+                } else {
+                    "not created".to_string()
+                };
+
+                println!("{:<20} {:<15} {:<10}", svc_name, container_name, status);
+            }
+        }
+
+        ComposeCommands::Logs(log_args) => {
+            if !compose_path.exists() {
+                return Err(anyhow!("compose file not found: {}", compose_path.display()));
+            }
+
+            let comp = compose::parse_compose_file(compose_path)?;
+            let project_name = compose_path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("corten");
+
+            for svc_name in comp.services.keys() {
+                if let Some(ref target) = log_args.service {
+                    if svc_name != target { continue; }
+                }
+
+                let container_name = comp.services[svc_name].container_name.clone()
+                    .unwrap_or_else(|| format!("{project_name}-{svc_name}"));
+
+                if let Ok(dir) = container::find_container(&container_name) {
+                    let log_file = dir.join("stdout.log");
+                    if log_file.exists() {
+                        let content = std::fs::read_to_string(&log_file)?;
+                        for line in content.lines() {
+                            println!("{svc_name} | {line}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     Ok(())
 }

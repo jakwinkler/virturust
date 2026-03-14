@@ -69,6 +69,9 @@ pub enum Commands {
 
     /// Copy files between container and host
     Cp(CpArgs),
+
+    /// Multi-container orchestration
+    Compose(ComposeArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -309,4 +312,42 @@ pub struct BuildArgs {
     /// Show the build plan without actually building
     #[arg(long)]
     pub dry_run: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ComposeArgs {
+    #[command(subcommand)]
+    pub command: ComposeCommands,
+
+    /// Path to compose file
+    #[arg(short, long, default_value = "corten-compose.yml", global = true)]
+    pub file: String,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ComposeCommands {
+    /// Create and start all services
+    Up(ComposeUpArgs),
+    /// Stop and remove all services
+    Down,
+    /// List services
+    Ps,
+    /// View service logs
+    Logs(ComposeLogsArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ComposeUpArgs {
+    /// Run in background
+    #[arg(short = 'd', long)]
+    pub detach: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ComposeLogsArgs {
+    /// Service name (all if omitted)
+    pub service: Option<String>,
+    /// Follow log output
+    #[arg(short, long)]
+    pub follow: bool,
 }

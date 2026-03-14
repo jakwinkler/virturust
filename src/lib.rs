@@ -24,6 +24,7 @@
 //! | [`network`]    | Network namespace setup                            |
 
 pub mod build;
+pub mod compose;
 pub mod cgroup;
 pub mod cli;
 pub mod config;
