@@ -35,7 +35,7 @@ async fn main() -> Result<()> {
         Commands::Network(args) => cmd_network(args)?,
         Commands::Logs(args) => cmd_logs(args)?,
         Commands::Exec(args) => cmd_exec(args)?,
-        Commands::Build(args) => cmd_build(args)?,
+        Commands::Build(args) => cmd_build(args).await?,
         Commands::Image(args) => cmd_image(args)?,
         Commands::System(args) => cmd_system(args)?,
     }
@@ -445,7 +445,7 @@ fn cmd_exec(args: corten::cli::ExecArgs) -> Result<()> {
 }
 
 /// Execute the `build` subcommand — build an image from Corten.toml.
-fn cmd_build(args: corten::cli::BuildArgs) -> Result<()> {
+async fn cmd_build(args: corten::cli::BuildArgs) -> Result<()> {
     use corten::build;
 
     let path = std::path::Path::new(&args.path);
@@ -469,10 +469,8 @@ fn cmd_build(args: corten::cli::BuildArgs) -> Result<()> {
 
     require_privileges()?;
 
-    // Build the image (async for downloading base OS)
     let toml_dir = toml_path.parent().unwrap_or_else(|| std::path::Path::new("."));
-    let rt = tokio::runtime::Handle::current();
-    rt.block_on(build::build_image(&config, toml_dir))?;
+    build::build_image(&config, toml_dir).await?;
 
     Ok(())
 }

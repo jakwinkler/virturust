@@ -36,8 +36,8 @@ check_output() {
     shift 2
     TOTAL=$((TOTAL + 1))
     local output
-    output=$("$@" 2>&1) || true
-    if echo "$output" | grep -q "$expected"; then
+    output=$("$@" 2>/dev/null) || true
+    if echo "$output" | grep -qE "$expected"; then
         green "  PASS: $name"
         PASS=$((PASS + 1))
     else
@@ -191,7 +191,7 @@ check_fail "network none blocks ping" \
     $CORTEN run --name net-none --network none alpine ping -c 1 -W 2 8.8.8.8
 $CORTEN rm net-none 2>/dev/null || true
 
-check_output "network host shows host interfaces" "eth\|enp\|ens\|wl" \
+check_output "network host shows host interfaces" "eth|enp|ens|wl" \
     $CORTEN run --name net-host --network host alpine ip link show
 $CORTEN rm net-host 2>/dev/null || true
 

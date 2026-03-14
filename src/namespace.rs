@@ -121,17 +121,16 @@ fn child_main(args: &ChildArgs) -> Result<()> {
         ));
     }
 
-    // Redirect stdout/stderr to log files BEFORE pivot_root
-    // (after pivot_root the host path is no longer accessible)
-    if !args.stdout_log.is_empty() {
-        if let Ok(file) = std::fs::File::create(&args.stdout_log) {
-            use std::os::unix::io::IntoRawFd;
-            let fd = file.into_raw_fd();
-            unsafe { libc::dup2(fd, 1) }; // stdout
-            unsafe { libc::dup2(fd, 2) }; // stderr goes to same file
-            unsafe { libc::close(fd) };
-        }
-    }
+    // Open log file BEFORE pivot_root (host path won't be accessible after)
+    // but don't redirect yet — we want setup logs to go to the real stderr
+    let log_fd = if !args.stdout_log.is_empty() {
+        use std::os::unix::io::IntoRawFd;
+        std::fs::File::create(&args.stdout_log)
+            .ok()
+            .map(|f| f.into_raw_fd())
+    } else {
+        None
+    };
 
     // Set up the container's filesystem (mount /proc, /sys, /dev, volumes, then pivot_root)
     crate::filesystem::setup_container_fs(&args.rootfs, &args.volumes)?;
@@ -198,6 +197,16 @@ fn child_main(args: &ChildArgs) -> Result<()> {
         .map(|s| s.as_ptr())
         .chain(std::iter::once(std::ptr::null()))
         .collect();
+
+    // Redirect stdout/stderr to log file right before exec
+    // (all setup logging is done, only container output goes to the file)
+    if let Some(fd) = log_fd {
+        unsafe {
+            libc::dup2(fd, 1); // stdout
+            libc::dup2(fd, 2); // stderr
+            libc::close(fd);
+        }
+    }
 
     // exec replaces this process entirely with the target command.
     // If exec returns, it failed.
