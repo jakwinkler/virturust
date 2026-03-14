@@ -45,6 +45,15 @@ pub enum Commands {
 
     /// Manage networks
     Network(NetworkArgs),
+
+    /// View container logs
+    Logs(LogsArgs),
+
+    /// Execute a command in a running container
+    Exec(ExecArgs),
+
+    /// Build an image from a Corten.toml file
+    Build(BuildArgs),
 }
 
 /// Arguments for the `run` subcommand.
@@ -95,6 +104,10 @@ pub struct RunArgs {
     /// Format: host_port:container_port or ip:host_port:container_port
     #[arg(short = 'p', long = "publish")]
     pub publish: Vec<String>,
+
+    /// Run container in the background (detached mode)
+    #[arg(short = 'd', long)]
+    pub detach: bool,
 }
 
 /// Arguments for the `pull` subcommand.
@@ -158,4 +171,38 @@ pub struct NetworkCreateArgs {
 pub struct NetworkRmArgs {
     /// Name of the network to remove
     pub name: String,
+}
+
+/// Arguments for the `logs` subcommand.
+#[derive(clap::Args, Debug)]
+pub struct LogsArgs {
+    /// Container name or ID
+    pub name: String,
+
+    /// Follow log output (stream new lines)
+    #[arg(short, long)]
+    pub follow: bool,
+
+    /// Number of lines to show from the end
+    #[arg(short = 'n', long, default_value = "100")]
+    pub tail: usize,
+}
+
+/// Arguments for the `exec` subcommand.
+#[derive(clap::Args, Debug)]
+pub struct ExecArgs {
+    /// Container name or ID
+    pub name: String,
+
+    /// Command and arguments to execute
+    #[arg(trailing_var_arg = true, required = true)]
+    pub command: Vec<String>,
+}
+
+/// Arguments for the `build` subcommand.
+#[derive(clap::Args, Debug)]
+pub struct BuildArgs {
+    /// Path to directory containing Corten.toml, or path to the .toml file
+    #[arg(default_value = ".")]
+    pub path: String,
 }

@@ -3,7 +3,7 @@
 //! This binary provides the `corten` command-line tool for managing
 //! containers. See [`corten`] (the library crate) for architecture details.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 
 use corten::cli::{Cli, Commands};
@@ -33,6 +33,9 @@ async fn main() -> Result<()> {
         Commands::Inspect(args) => cmd_inspect(args)?,
         Commands::Rm(args) => cmd_rm(args)?,
         Commands::Network(args) => cmd_network(args)?,
+        Commands::Logs(args) => cmd_logs(args)?,
+        Commands::Exec(args) => cmd_exec(args)?,
+        Commands::Build(args) => cmd_build(args)?,
     }
 
     Ok(())
@@ -61,6 +64,7 @@ fn require_privileges() -> Result<()> {
 async fn cmd_run(args: corten::cli::RunArgs) -> Result<()> {
     require_privileges()?;
 
+    let detach = args.detach;
     let (name, tag) = parse_image_ref(&args.image);
 
     // Auto-pull if the image isn't available locally
@@ -132,8 +136,12 @@ async fn cmd_run(args: corten::cli::RunArgs) -> Result<()> {
         ports,
     };
 
-    let exit_code = container::run(&config)?;
-    std::process::exit(exit_code);
+    let exit_code = container::run(&config, detach)?;
+    if !detach {
+        std::process::exit(exit_code);
+    }
+    // In detach mode, run() returns 0 immediately
+    Ok(())
 }
 
 /// Execute the `pull` subcommand — download an image from Docker Hub.
@@ -343,6 +351,107 @@ fn cmd_rm(args: corten::cli::RmArgs) -> Result<()> {
 
     std::fs::remove_dir_all(&container_dir)?;
     println!("Removed container: {} ({})", cfg.name, &cfg.id[..12]);
+    Ok(())
+}
+
+/// Execute the `logs` subcommand — view container logs.
+fn cmd_logs(args: corten::cli::LogsArgs) -> Result<()> {
+    let container_dir = container::find_container(&args.name)?;
+    let stdout_log = container_dir.join("stdout.log");
+
+    if !stdout_log.exists() {
+        println!("No logs available for this container.");
+        return Ok(());
+    }
+
+    if args.follow {
+        // Stream the file (like tail -f)
+        use std::io::{BufRead, BufReader, Seek, SeekFrom};
+        let file = std::fs::File::open(&stdout_log)?;
+        let mut reader = BufReader::new(file);
+        // Seek to end and then poll for new content
+        reader.seek(SeekFrom::End(0))?;
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => std::thread::sleep(std::time::Duration::from_millis(100)),
+                Ok(_) => print!("{line}"),
+                Err(e) => return Err(e.into()),
+            }
+        }
+    } else {
+        // Read last N lines
+        let content = std::fs::read_to_string(&stdout_log)?;
+        let lines: Vec<&str> = content.lines().collect();
+        let start = lines.len().saturating_sub(args.tail);
+        for line in &lines[start..] {
+            println!("{line}");
+        }
+    }
+
+    Ok(())
+}
+
+/// Execute the `exec` subcommand — run a command in a running container.
+fn cmd_exec(args: corten::cli::ExecArgs) -> Result<()> {
+    require_privileges()?;
+
+    let container_dir = container::find_container(&args.name)?;
+    let state = container::load_state(&container_dir)?;
+
+    if state.status != ContainerStatus::Running {
+        return Err(anyhow!("container '{}' is not running", args.name));
+    }
+
+    let pid = state
+        .pid
+        .ok_or_else(|| anyhow!("container has no PID"))?;
+
+    if !container::is_process_alive(pid) {
+        return Err(anyhow!(
+            "container process (PID {pid}) is no longer running"
+        ));
+    }
+
+    // Use nsenter to enter the container's namespaces and run the command
+    let mut cmd = std::process::Command::new("nsenter");
+    cmd.args([
+        "--target",
+        &pid.to_string(),
+        "--mount",
+        "--uts",
+        "--ipc",
+        "--net",
+        "--pid",
+        "--",
+    ]);
+    cmd.args(&args.command);
+
+    let status = cmd
+        .status()
+        .context("failed to execute nsenter")?;
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+/// Execute the `build` subcommand — parse and validate a Corten.toml.
+fn cmd_build(args: corten::cli::BuildArgs) -> Result<()> {
+    use corten::build;
+
+    let path = std::path::Path::new(&args.path);
+    let toml_path = if path.is_dir() {
+        path.join("Corten.toml")
+    } else {
+        path.to_path_buf()
+    };
+
+    if !toml_path.exists() {
+        return Err(anyhow!("Corten.toml not found at {}", toml_path.display()));
+    }
+
+    let config = build::parse_build_config(&toml_path)?;
+    build::validate_build_config(&config)?;
+    build::print_build_plan(&config);
+
     Ok(())
 }
 

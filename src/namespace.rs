@@ -51,6 +51,12 @@ pub struct ChildArgs {
 
     /// Network mode: "bridge", "none", or "host"
     pub network_mode: String,
+
+    /// Path to redirect stdout to (for log capture)
+    pub stdout_log: String,
+
+    /// Path to redirect stderr to (for log capture)
+    pub stderr_log: String,
 }
 
 /// Entry point for the cloned child process.
@@ -118,6 +124,17 @@ fn child_main(args: &ChildArgs) -> Result<()> {
     // Bring up loopback networking inside the network namespace
     crate::network::setup_loopback().ok(); // Non-fatal if `ip` command not available
 
+    // Redirect stdout/stderr to log files (for log capture and detached mode)
+    if !args.stdout_log.is_empty() {
+        if let Ok(file) = std::fs::File::create(&args.stdout_log) {
+            use std::os::unix::io::IntoRawFd;
+            let fd = file.into_raw_fd();
+            unsafe { libc::dup2(fd, 1) }; // stdout
+            unsafe { libc::dup2(fd, 2) }; // stderr goes to same file
+            unsafe { libc::close(fd) };
+        }
+    }
+
     // Apply environment variables from image config
     for env_var in &args.env {
         if let Some((key, value)) = env_var.split_once('=') {
@@ -133,10 +150,16 @@ fn child_main(args: &ChildArgs) -> Result<()> {
             .with_context(|| format!("failed to chdir to {}", args.working_dir))?;
     }
 
+    // Security hardening: mask sensitive paths (after pivot_root)
+    crate::security::mask_paths().ok();
+
     // Apply user (setgid then setuid — must set gid first)
     if !args.user.is_empty() {
         apply_user(&args.user)?;
     }
+
+    // Security hardening: drop capabilities to safe default set (before exec)
+    crate::security::drop_capabilities().ok();
 
     // Build the argv for exec
     if args.command.is_empty() {

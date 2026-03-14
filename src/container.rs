@@ -101,7 +101,7 @@ pub fn is_process_alive(pid: i32) -> bool {
 ///
 /// The container process's exit code (0 = success, non-zero = error,
 /// 128+N = killed by signal N).
-pub fn run(config: &ContainerConfig) -> Result<i32> {
+pub fn run(config: &ContainerConfig, detach: bool) -> Result<i32> {
     log::info!(
         "starting container '{}' (id={}, image={})",
         config.name,
@@ -196,6 +196,8 @@ pub fn run(config: &ContainerConfig) -> Result<i32> {
         working_dir: config.working_dir.clone(),
         user: config.user.clone(),
         network_mode: config.network_mode.clone(),
+        stdout_log: container_dir.join("stdout.log").to_string_lossy().to_string(),
+        stderr_log: container_dir.join("stderr.log").to_string_lossy().to_string(),
     };
 
     let child_pid = create_namespaced_process(child_args)?;
@@ -278,6 +280,12 @@ pub fn run(config: &ContainerConfig) -> Result<i32> {
     save_state(&container_dir, &state)?;
 
     println!("Container '{}' started (PID {})", config.name, child_pid);
+
+    // In detach mode, return immediately without waiting for the child
+    if detach {
+        println!("{}", config.id);
+        return Ok(0);
+    }
 
     // Wait for the container process to exit
     let mut wait_status: libc::c_int = 0;

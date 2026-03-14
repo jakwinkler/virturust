@@ -20,8 +20,10 @@
 //! | [`filesystem`] | Mount setup and `pivot_root` isolation             |
 //! | [`image`]      | OCI image pulling from Docker Hub                  |
 //! | [`namespace`]  | Linux namespace creation via `clone()`             |
+//! | [`build`]      | Corten.toml build file parser                      |
 //! | [`network`]    | Network namespace setup                            |
 
+pub mod build;
 pub mod cgroup;
 pub mod cli;
 pub mod config;
@@ -30,3 +32,4 @@ pub mod filesystem;
 pub mod image;
 pub mod namespace;
 pub mod network;
+pub mod security;
