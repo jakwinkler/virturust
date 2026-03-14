@@ -60,6 +60,12 @@ pub struct ChildArgs {
 
     /// Whether to run in rootless mode (user namespace)
     pub rootless: bool,
+
+    /// Give extended privileges (skip security hardening)
+    pub privileged: bool,
+
+    /// Mount root filesystem as read-only
+    pub read_only: bool,
 }
 
 /// Entry point for the cloned child process.
@@ -153,19 +159,36 @@ fn child_main(args: &ChildArgs) -> Result<()> {
             .with_context(|| format!("failed to chdir to {}", args.working_dir))?;
     }
 
-    // Security hardening: mask sensitive paths (after pivot_root)
-    crate::security::mask_paths().ok();
+    // Read-only root filesystem
+    if args.read_only {
+        let root = std::ffi::CString::new("/").unwrap();
+        unsafe {
+            libc::mount(
+                std::ptr::null(),
+                root.as_ptr(),
+                std::ptr::null(),
+                libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_BIND,
+                std::ptr::null(),
+            );
+        }
+        log::info!("mounted root filesystem as read-only");
+    }
+
+    // Security hardening (skip in privileged mode)
+    if !args.privileged {
+        crate::security::mask_paths().ok();
+    }
 
     // Apply user (setgid then setuid — must set gid first)
     if !args.user.is_empty() {
         apply_user(&args.user)?;
     }
 
-    // Security hardening: drop capabilities to safe default set (before exec)
-    crate::security::drop_capabilities().ok();
-
-    // Security hardening: apply seccomp-BPF filter (after caps, before exec)
-    crate::security::apply_seccomp_filter().ok();
+    // Security hardening (skip in privileged mode)
+    if !args.privileged {
+        crate::security::drop_capabilities().ok();
+        crate::security::apply_seccomp_filter().ok();
+    }
 
     // Build the argv for exec
     if args.command.is_empty() {

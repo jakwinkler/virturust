@@ -255,6 +255,8 @@ pub fn run(config: &ContainerConfig, detach: bool) -> Result<i32> {
                 String::new()
             },
             rootless: config.rootless,
+            privileged: config.privileged,
+            read_only: config.read_only,
         };
 
         let child_pid = create_namespaced_process(child_args)?;
@@ -418,6 +420,12 @@ pub fn run(config: &ContainerConfig, detach: bool) -> Result<i32> {
     // Cleanup cgroup (container state is preserved for inspection)
     if let Some(cg) = cgroup {
         cg.destroy().ok();
+    }
+
+    // Auto-remove if --rm was specified
+    if config.auto_remove {
+        fs::remove_dir_all(&container_dir).ok();
+        log::info!("auto-removed container '{}'", config.name);
     }
 
     log::info!(

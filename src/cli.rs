@@ -60,6 +60,35 @@ pub enum Commands {
 
     /// System maintenance
     System(SystemSubArgs),
+
+    /// Show live resource usage statistics
+    Stats(StatsArgs),
+
+    /// Send a signal to a running container
+    Kill(KillArgs),
+
+    /// Copy files between container and host
+    Cp(CpArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct StatsArgs {
+    /// Container name or ID (shows all if omitted)
+    pub name: Option<String>,
+
+    /// Show a single snapshot instead of streaming
+    #[arg(long)]
+    pub no_stream: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct KillArgs {
+    /// Container name or ID
+    pub name: String,
+
+    /// Signal to send (default: SIGKILL)
+    #[arg(short, long, default_value = "KILL")]
+    pub signal: String,
 }
 
 #[derive(clap::Args, Debug)]
@@ -146,6 +175,39 @@ pub struct RunArgs {
     /// Run in rootless mode (user namespace, no root required)
     #[arg(long)]
     pub rootless: bool,
+
+    /// Automatically remove the container when it exits
+    #[arg(long)]
+    pub rm: bool,
+
+    /// Set environment variables (KEY=VALUE)
+    #[arg(short = 'e', long = "env")]
+    pub env: Vec<String>,
+
+    /// Read environment variables from a file
+    #[arg(long)]
+    pub env_file: Option<String>,
+
+    /// Give extended privileges to this container
+    #[arg(long)]
+    pub privileged: bool,
+
+    /// Mount the container's root filesystem as read-only
+    #[arg(long)]
+    pub read_only: bool,
+
+    /// Override the image entrypoint
+    #[arg(long)]
+    pub entrypoint: Option<String>,
+}
+
+/// Arguments for the `cp` subcommand.
+#[derive(clap::Args, Debug)]
+pub struct CpArgs {
+    /// Source (container:path or host path)
+    pub src: String,
+    /// Destination (container:path or host path)
+    pub dst: String,
 }
 
 /// Arguments for the `pull` subcommand.

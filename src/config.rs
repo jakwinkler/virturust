@@ -104,6 +104,18 @@ pub struct ContainerConfig {
     /// Whether to run in rootless mode (user namespace)
     #[serde(default)]
     pub rootless: bool,
+
+    /// Give extended privileges (disable security restrictions)
+    #[serde(default)]
+    pub privileged: bool,
+
+    /// Mount root filesystem as read-only
+    #[serde(default)]
+    pub read_only: bool,
+
+    /// Automatically remove container on exit
+    #[serde(default)]
+    pub auto_remove: bool,
 }
 
 fn default_network_mode() -> String {
