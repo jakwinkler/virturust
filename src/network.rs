@@ -443,60 +443,37 @@ pub fn setup_port_forwarding(
     container_ip: &str,
     ports: &[crate::config::PortMapping],
 ) -> Result<()> {
-    let has_firewalld = Command::new("firewall-cmd")
-        .arg("--state")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-
+    // Always use iptables for port forwarding (DNAT).
+    // firewalld's --add-forward-port only handles external traffic,
+    // not localhost. iptables DNAT works for both.
     for port in ports {
         let dport = port.host_port.to_string();
         let to_dest = format!("{container_ip}:{}", port.container_port);
 
-        if has_firewalld {
-            // Use firewalld for port forwarding
-            let fwd = format!(
-                "port={}:proto=tcp:toaddr={}:toport={}",
-                port.host_port, container_ip, port.container_port
-            );
-            run_cmd("firewall-cmd", &["--zone=trusted", &format!("--add-forward-port={fwd}")])
-                .with_context(|| format!("firewalld forward port failed: {fwd}"))?;
+        // PREROUTING: external traffic arriving at the host
+        run_cmd(
+            "iptables",
+            &[
+                "-t", "nat", "-I", "PREROUTING",
+                "-p", "tcp", "--dport", &dport,
+                "-j", "DNAT", "--to-destination", &to_dest,
+            ],
+        )
+        .with_context(|| format!(
+            "failed to add DNAT rule for {}:{} -> {}:{}",
+            port.host_ip, port.host_port, container_ip, port.container_port
+        ))?;
 
-            // Also allow direct access from the host itself
-            run_cmd(
-                "iptables",
-                &[
-                    "-t", "nat", "-A", "OUTPUT",
-                    "-p", "tcp", "--dport", &dport,
-                    "-j", "DNAT", "--to-destination", &to_dest,
-                ],
-            )
-            .ok();
-        } else {
-            // Use iptables directly
-            run_cmd(
-                "iptables",
-                &[
-                    "-t", "nat", "-A", "PREROUTING",
-                    "-p", "tcp", "--dport", &dport,
-                    "-j", "DNAT", "--to-destination", &to_dest,
-                ],
-            )
-            .with_context(|| format!(
-                "failed to add DNAT rule for {}:{} -> {}:{}",
-                port.host_ip, port.host_port, container_ip, port.container_port
-            ))?;
-
-            run_cmd(
-                "iptables",
-                &[
-                    "-t", "nat", "-A", "OUTPUT",
-                    "-p", "tcp", "--dport", &dport,
-                    "-j", "DNAT", "--to-destination", &to_dest,
-                ],
-            )
-            .ok();
-        }
+        // OUTPUT: localhost traffic (curl http://127.0.0.1:port)
+        run_cmd(
+            "iptables",
+            &[
+                "-t", "nat", "-I", "OUTPUT",
+                "-p", "tcp", "--dport", &dport,
+                "-j", "DNAT", "--to-destination", &to_dest,
+            ],
+        )
+        .ok();
 
         log::info!(
             "port forwarding: {}:{} -> {}:{}",
@@ -511,25 +488,11 @@ pub fn cleanup_port_forwarding(
     container_ip: &str,
     ports: &[crate::config::PortMapping],
 ) -> Result<()> {
-    let has_firewalld = Command::new("firewall-cmd")
-        .arg("--state")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-
     for port in ports {
         let dport = port.host_port.to_string();
         let to_dest = format!("{container_ip}:{}", port.container_port);
 
-        if has_firewalld {
-            let fwd = format!(
-                "port={}:proto=tcp:toaddr={}:toport={}",
-                port.host_port, container_ip, port.container_port
-            );
-            run_cmd("firewall-cmd", &["--zone=trusted", &format!("--remove-forward-port={fwd}")]).ok();
-        }
-
-        // Remove iptables rules (best-effort, may not exist)
+        // Remove iptables DNAT rules (best-effort)
         run_cmd(
             "iptables",
             &[

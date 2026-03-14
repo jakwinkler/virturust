@@ -105,6 +105,7 @@ run = [
     "mkdir -p /run/nginx /var/www/html /var/log/nginx /var/lib/nginx/tmp",
     "echo '<h1>Corten Nginx</h1>' > /var/www/html/index.html",
     "chown -R nginx:nginx /run/nginx /var/log/nginx /var/lib/nginx",
+    "printf 'server {\\n  listen 80 default_server;\\n  root /var/www/html;\\n  location / { try_files $uri $uri/ =404; }\\n}\\n' > /etc/nginx/http.d/default.conf",
 ]
 
 [container]
