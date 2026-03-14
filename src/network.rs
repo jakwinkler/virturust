@@ -135,6 +135,20 @@ pub fn setup_nat() -> Result<()> {
     .context("failed to add iptables MASQUERADE rule")?;
 
     log::info!("added NAT masquerade rule for {BRIDGE_SUBNET}");
+
+    // Allow forwarding for container traffic (FORWARD chain may default to DROP)
+    run_cmd(
+        "iptables",
+        &["-A", "FORWARD", "-s", BRIDGE_SUBNET, "-j", "ACCEPT"],
+    )
+    .ok();
+    run_cmd(
+        "iptables",
+        &["-A", "FORWARD", "-d", BRIDGE_SUBNET, "-j", "ACCEPT"],
+    )
+    .ok();
+
+    log::info!("added FORWARD accept rules for {BRIDGE_SUBNET}");
     Ok(())
 }
 

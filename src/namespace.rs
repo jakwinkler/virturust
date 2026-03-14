@@ -121,13 +121,8 @@ fn child_main(args: &ChildArgs) -> Result<()> {
         ));
     }
 
-    // Set up the container's filesystem (mount /proc, /sys, /dev, volumes, then pivot_root)
-    crate::filesystem::setup_container_fs(&args.rootfs, &args.volumes)?;
-
-    // Bring up loopback networking inside the network namespace
-    crate::network::setup_loopback().ok(); // Non-fatal if `ip` command not available
-
-    // Redirect stdout/stderr to log files (for log capture and detached mode)
+    // Redirect stdout/stderr to log files BEFORE pivot_root
+    // (after pivot_root the host path is no longer accessible)
     if !args.stdout_log.is_empty() {
         if let Ok(file) = std::fs::File::create(&args.stdout_log) {
             use std::os::unix::io::IntoRawFd;
@@ -137,6 +132,12 @@ fn child_main(args: &ChildArgs) -> Result<()> {
             unsafe { libc::close(fd) };
         }
     }
+
+    // Set up the container's filesystem (mount /proc, /sys, /dev, volumes, then pivot_root)
+    crate::filesystem::setup_container_fs(&args.rootfs, &args.volumes)?;
+
+    // Bring up loopback networking inside the network namespace
+    crate::network::setup_loopback().ok(); // Non-fatal if `ip` command not available
 
     // Apply environment variables from image config
     for env_var in &args.env {
