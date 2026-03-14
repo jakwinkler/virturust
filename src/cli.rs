@@ -70,8 +70,8 @@ pub enum Commands {
     /// Copy files between container and host
     Cp(CpArgs),
 
-    /// Multi-container orchestration
-    Compose(ComposeArgs),
+    /// Forge — multi-container orchestration from TOML
+    Forge(ComposeArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -314,13 +314,14 @@ pub struct BuildArgs {
     pub dry_run: bool,
 }
 
+/// Arguments for the `forge` subcommand (multi-container orchestration).
 #[derive(clap::Args, Debug)]
 pub struct ComposeArgs {
     #[command(subcommand)]
     pub command: ComposeCommands,
 
-    /// Path to compose file
-    #[arg(short, long, default_value = "corten-compose.yml", global = true)]
+    /// Path to forge file (Cortenforge.toml or .json)
+    #[arg(short, long, default_value = "Cortenforge.toml", global = true)]
     pub file: String,
 }
 

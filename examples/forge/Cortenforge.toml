@@ -1,0 +1,42 @@
+# Full-stack example: API + Database + Worker
+#
+# Build images first:
+#   sudo corten build examples/nginx
+#   sudo corten pull alpine
+#
+# Then forge:
+#   cd examples/forge
+#   sudo corten forge up
+#   sudo corten forge ps
+#   sudo corten forge logs
+#   sudo corten forge down
+
+[services.db]
+image = "alpine"
+command = ["sh", "-c", "echo 'DB ready' && sleep 3600"]
+restart = "always"
+memory = "256m"
+
+[services.db.env]
+DB_NAME = "myapp"
+DB_USER = "app"
+
+[services.api]
+image = "alpine"
+command = ["sh", "-c", "echo 'API listening on :8000' && sleep 3600"]
+ports = ["8000:8000"]
+depends_on = ["db"]
+restart = "always"
+memory = "128m"
+
+[services.api.env]
+DB_HOST = "db"
+API_PORT = "8000"
+
+[services.worker]
+image = "alpine"
+command = ["sh", "-c", "echo 'Worker processing jobs' && sleep 3600"]
+depends_on = ["api", "db"]
+
+[services.worker.env]
+WORKER_MODE = "background"

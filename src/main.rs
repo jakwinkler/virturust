@@ -41,7 +41,7 @@ async fn main() -> Result<()> {
         Commands::Stats(args) => cmd_stats(args)?,
         Commands::Kill(args) => cmd_kill(args)?,
         Commands::Cp(args) => cmd_cp(args)?,
-        Commands::Compose(args) => cmd_compose(args).await?,
+        Commands::Forge(args) => cmd_forge(args).await?,
     }
 
     Ok(())
@@ -807,7 +807,7 @@ fn cmd_system_prune() -> Result<()> {
     Ok(())
 }
 
-async fn cmd_compose(args: corten::cli::ComposeArgs) -> Result<()> {
+async fn cmd_forge(args: corten::cli::ComposeArgs) -> Result<()> {
     use corten::compose;
     use corten::cli::ComposeCommands;
 
@@ -821,11 +821,11 @@ async fn cmd_compose(args: corten::cli::ComposeArgs) -> Result<()> {
                 return Err(anyhow!("compose file not found: {}", compose_path.display()));
             }
 
-            let comp = compose::parse_compose_file(compose_path)?;
+            let comp = compose::parse_forge_file(compose_path)?;
             let order = compose::resolve_order(&comp)?;
 
             println!("Starting {} services...", comp.services.len());
-            compose::print_compose_summary(&comp);
+            compose::print_forge_summary(&comp);
             println!();
 
             // Create project network
@@ -857,17 +857,11 @@ async fn cmd_compose(args: corten::cli::ComposeArgs) -> Result<()> {
                     .or_else(|| if !img_config.cmd.is_empty() { Some(img_config.cmd.clone()) } else { None })
                     .unwrap_or_else(|| vec!["/bin/sh".to_string()]);
 
-                let memory_bytes = svc.deploy.as_ref()
-                    .and_then(|d| d.resources.as_ref())
-                    .and_then(|r| r.limits.as_ref())
-                    .and_then(|l| l.memory.as_ref())
-                    .map(|m| corten::config::parse_memory(m))
+                let memory_bytes = svc.memory.as_deref()
+                    .map(corten::config::parse_memory)
                     .transpose()?;
 
-                let cpu_quota = svc.deploy.as_ref()
-                    .and_then(|d| d.resources.as_ref())
-                    .and_then(|r| r.limits.as_ref())
-                    .and_then(|l| l.cpus.as_ref())
+                let cpu_quota = svc.cpus.as_deref()
                     .and_then(|c| c.parse::<f64>().ok());
 
                 let volumes = svc.volumes.iter()
@@ -895,16 +889,14 @@ async fn cmd_compose(args: corten::cli::ComposeArgs) -> Result<()> {
                     volumes,
                     env: {
                         let mut env = img_config.env;
-                        env.extend(svc.environment.clone());
+                        for (k, v) in &svc.env {
+                            env.push(format!("{k}={v}"));
+                        }
                         env
                     },
                     working_dir: svc.working_dir.clone().unwrap_or(img_config.working_dir),
                     user: svc.user.clone().unwrap_or(img_config.user),
-                    network_mode: if !svc.networks.is_empty() {
-                        svc.networks[0].clone()
-                    } else {
-                        net_name.clone()
-                    },
+                    network_mode: svc.network.clone().unwrap_or_else(|| net_name.clone()),
                     ports,
                     restart_policy: svc.restart.clone().unwrap_or_else(|| "no".to_string()),
                     rootless: false,
@@ -928,7 +920,7 @@ async fn cmd_compose(args: corten::cli::ComposeArgs) -> Result<()> {
                 return Err(anyhow!("compose file not found: {}", compose_path.display()));
             }
 
-            let comp = compose::parse_compose_file(compose_path)?;
+            let comp = compose::parse_forge_file(compose_path)?;
             let order = compose::resolve_order(&comp)?;
 
             let project_name = compose_path.file_stem()
@@ -960,7 +952,7 @@ async fn cmd_compose(args: corten::cli::ComposeArgs) -> Result<()> {
                 return Err(anyhow!("compose file not found: {}", compose_path.display()));
             }
 
-            let comp = compose::parse_compose_file(compose_path)?;
+            let comp = compose::parse_forge_file(compose_path)?;
             let project_name = compose_path.file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("corten");
@@ -991,7 +983,7 @@ async fn cmd_compose(args: corten::cli::ComposeArgs) -> Result<()> {
                 return Err(anyhow!("compose file not found: {}", compose_path.display()));
             }
 
-            let comp = compose::parse_compose_file(compose_path)?;
+            let comp = compose::parse_forge_file(compose_path)?;
             let project_name = compose_path.file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("corten");
