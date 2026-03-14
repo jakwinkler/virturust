@@ -1,18 +1,18 @@
-//! VirtuRust CLI entry point.
+//! Corten CLI entry point.
 //!
-//! This binary provides the `virturust` command-line tool for managing
-//! containers. See [`virturust`] (the library crate) for architecture details.
+//! This binary provides the `corten` command-line tool for managing
+//! containers. See [`corten`] (the library crate) for architecture details.
 
 use anyhow::{anyhow, Result};
 use clap::Parser;
 
-use virturust::cli::{Cli, Commands};
-use virturust::config::{
-    self, has_cap_sys_admin, parse_image_ref, parse_memory, ContainerConfig, ContainerStatus,
-    ResourceLimits,
+use corten::cli::{Cli, Commands};
+use corten::config::{
+    self, has_cap_sys_admin, parse_image_ref, parse_memory, parse_port, parse_volume,
+    ContainerConfig, ContainerStatus, ResourceLimits,
 };
-use virturust::container;
-use virturust::image;
+use corten::container;
+use corten::image;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -32,6 +32,7 @@ async fn main() -> Result<()> {
         Commands::Stop(args) => cmd_stop(args)?,
         Commands::Inspect(args) => cmd_inspect(args)?,
         Commands::Rm(args) => cmd_rm(args)?,
+        Commands::Network(args) => cmd_network(args)?,
     }
 
     Ok(())
@@ -52,12 +53,12 @@ fn require_privileges() -> Result<()> {
          Option 1 (recommended): Install with capabilities (one-time sudo):\n\
          \x20 make install\n\n\
          Option 2: Run with sudo:\n\
-         \x20 sudo virturust run ..."
+         \x20 sudo corten run ..."
     ))
 }
 
 /// Execute the `run` subcommand — pull image if needed and start a container.
-async fn cmd_run(args: virturust::cli::RunArgs) -> Result<()> {
+async fn cmd_run(args: corten::cli::RunArgs) -> Result<()> {
     require_privileges()?;
 
     let (name, tag) = parse_image_ref(&args.image);
@@ -69,6 +70,9 @@ async fn cmd_run(args: virturust::cli::RunArgs) -> Result<()> {
     }
 
     let rootfs = image::image_rootfs(name, tag);
+
+    // Load OCI image config (ENV, CMD, ENTRYPOINT, WORKDIR, USER)
+    let img_config = image::load_image_config(name, tag);
 
     // Parse resource limits from CLI arguments
     let memory_bytes = args.memory.as_deref().map(parse_memory).transpose()?;
@@ -83,11 +87,34 @@ async fn cmd_run(args: virturust::cli::RunArgs) -> Result<()> {
     let id = uuid::Uuid::new_v4().to_string();
     let container_name = args.name.unwrap_or_else(|| id[..12].to_string());
     let hostname = args.hostname.unwrap_or_else(|| id[..12].to_string());
-    let command = if args.command.is_empty() {
-        vec!["/bin/sh".to_string()]
-    } else {
+
+    // Resolve command: CLI args > image ENTRYPOINT + CMD
+    let command = if !args.command.is_empty() {
         args.command
+    } else if !img_config.entrypoint.is_empty() {
+        // ENTRYPOINT + CMD (Docker semantics)
+        let mut cmd = img_config.entrypoint.clone();
+        cmd.extend(img_config.cmd.clone());
+        cmd
+    } else if !img_config.cmd.is_empty() {
+        img_config.cmd.clone()
+    } else {
+        vec!["/bin/sh".to_string()]
     };
+
+    // Parse volume mounts
+    let volumes = args
+        .volumes
+        .iter()
+        .map(|v| parse_volume(v))
+        .collect::<Result<Vec<_>>>()?;
+
+    // Parse port mappings
+    let ports = args
+        .publish
+        .iter()
+        .map(|p| parse_port(p))
+        .collect::<Result<Vec<_>>>()?;
 
     let config = ContainerConfig {
         id,
@@ -97,6 +124,12 @@ async fn cmd_run(args: virturust::cli::RunArgs) -> Result<()> {
         hostname,
         resources,
         rootfs,
+        volumes,
+        env: img_config.env,
+        working_dir: img_config.working_dir,
+        user: img_config.user,
+        network_mode: args.network,
+        ports,
     };
 
     let exit_code = container::run(&config)?;
@@ -104,7 +137,7 @@ async fn cmd_run(args: virturust::cli::RunArgs) -> Result<()> {
 }
 
 /// Execute the `pull` subcommand — download an image from Docker Hub.
-async fn cmd_pull(args: virturust::cli::PullArgs) -> Result<()> {
+async fn cmd_pull(args: corten::cli::PullArgs) -> Result<()> {
     let (name, tag) = parse_image_ref(&args.image);
     image::pull_image(name, tag).await?;
     Ok(())
@@ -115,7 +148,7 @@ fn cmd_images() -> Result<()> {
     let images = image::list_images()?;
 
     if images.is_empty() {
-        println!("No images found. Pull one with: virturust pull <image>");
+        println!("No images found. Pull one with: corten pull <image>");
         return Ok(());
     }
 
@@ -188,7 +221,7 @@ fn cmd_ps() -> Result<()> {
 }
 
 /// Execute the `stop` subcommand — stop a running container.
-fn cmd_stop(args: virturust::cli::StopArgs) -> Result<()> {
+fn cmd_stop(args: corten::cli::StopArgs) -> Result<()> {
     require_privileges()?;
 
     let container_dir = container::find_container(&args.name)?;
@@ -196,7 +229,7 @@ fn cmd_stop(args: virturust::cli::StopArgs) -> Result<()> {
 }
 
 /// Execute the `inspect` subcommand — show detailed container info.
-fn cmd_inspect(args: virturust::cli::InspectArgs) -> Result<()> {
+fn cmd_inspect(args: corten::cli::InspectArgs) -> Result<()> {
     let container_dir = container::find_container(&args.name)?;
     let cfg = container::load_config(&container_dir)?;
     let mut state = container::load_state(&container_dir)?;
@@ -232,6 +265,43 @@ fn cmd_inspect(args: virturust::cli::InspectArgs) -> Result<()> {
     println!("  PIDs max:   {}", cfg.resources.pids_max
         .map(|p| p.to_string())
         .unwrap_or("unlimited".into()));
+    if !cfg.env.is_empty() {
+        println!();
+        println!("Environment:");
+        for var in &cfg.env {
+            println!("  {var}");
+        }
+    }
+    if !cfg.working_dir.is_empty() {
+        println!("WorkingDir:   {}", cfg.working_dir);
+    }
+    if !cfg.user.is_empty() {
+        println!("User:         {}", cfg.user);
+    }
+    println!("Network:      {}", cfg.network_mode);
+    if !cfg.ports.is_empty() {
+        println!();
+        println!("Ports:");
+        for port in &cfg.ports {
+            println!(
+                "  {}:{} -> {}",
+                port.host_ip, port.host_port, port.container_port
+            );
+        }
+    }
+    if !cfg.volumes.is_empty() {
+        println!();
+        println!("Volumes:");
+        for vol in &cfg.volumes {
+            let mode = if vol.read_only { "ro" } else { "rw" };
+            println!(
+                "  {} -> {} ({})",
+                vol.host_path.display(),
+                vol.container_path.display(),
+                mode
+            );
+        }
+    }
     println!();
     println!("Rootfs:       {}", cfg.rootfs.display());
 
@@ -252,7 +322,7 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 /// Execute the `rm` subcommand — remove a stopped container.
-fn cmd_rm(args: virturust::cli::RmArgs) -> Result<()> {
+fn cmd_rm(args: corten::cli::RmArgs) -> Result<()> {
     let container_dir = container::find_container(&args.name)?;
     let cfg = container::load_config(&container_dir)?;
 
@@ -262,7 +332,7 @@ fn cmd_rm(args: virturust::cli::RmArgs) -> Result<()> {
             if let Some(pid) = state.pid {
                 if container::is_process_alive(pid) {
                     return Err(anyhow!(
-                        "cannot remove running container '{}'. Stop it first: virturust stop {}",
+                        "cannot remove running container '{}'. Stop it first: corten stop {}",
                         cfg.name,
                         cfg.name
                     ));
@@ -273,5 +343,43 @@ fn cmd_rm(args: virturust::cli::RmArgs) -> Result<()> {
 
     std::fs::remove_dir_all(&container_dir)?;
     println!("Removed container: {} ({})", cfg.name, &cfg.id[..12]);
+    Ok(())
+}
+
+/// Execute the `network` subcommand — manage named networks.
+fn cmd_network(args: corten::cli::NetworkArgs) -> Result<()> {
+    use corten::cli::NetworkCommands;
+    use corten::network;
+
+    match args.command {
+        NetworkCommands::Create(create_args) => {
+            require_privileges()?;
+            let info = network::create_network(&create_args.name)?;
+            println!(
+                "Created network '{}' (bridge={}, subnet={})",
+                info.name, info.bridge, info.subnet
+            );
+        }
+        NetworkCommands::Ls => {
+            let networks = network::list_networks()?;
+            if networks.is_empty() {
+                println!("No networks found. Create one with: corten network create <name>");
+            } else {
+                println!("{:<20} {:<15} {:<20} {}", "NAME", "BRIDGE", "SUBNET", "CONTAINERS");
+                println!("{}", "-".repeat(65));
+                for net in &networks {
+                    println!(
+                        "{:<20} {:<15} {:<20} {}",
+                        net.name, net.bridge, net.subnet, net.containers.len()
+                    );
+                }
+            }
+        }
+        NetworkCommands::Rm(rm_args) => {
+            require_privileges()?;
+            network::remove_network(&rm_args.name)?;
+            println!("Removed network '{}'", rm_args.name);
+        }
+    }
     Ok(())
 }

@@ -11,10 +11,10 @@
 //! | IPC       | `CLONE_NEWIPC`  | Shared memory, semaphores, message queues|
 //! | Network   | `CLONE_NEWNET`  | Network interfaces, routing, iptables    |
 //!
-//! VirtuRust uses `clone()` with these flags to create a child process
+//! Corten uses `clone()` with these flags to create a child process
 //! that is born into all new namespaces simultaneously.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use std::ffi::CString;
 
 /// Arguments passed to the container's init process (PID 1).
@@ -36,6 +36,21 @@ pub struct ChildArgs {
     /// Read end of the sync pipe — the child blocks on this until
     /// the parent has finished cgroup setup
     pub sync_pipe_rd: i32,
+
+    /// Volume mounts to apply before pivot_root
+    pub volumes: Vec<crate::config::VolumeMount>,
+
+    /// Environment variables to set (KEY=VALUE format)
+    pub env: Vec<String>,
+
+    /// Working directory inside the container
+    pub working_dir: String,
+
+    /// User to run as (user or user:group)
+    pub user: String,
+
+    /// Network mode: "bridge", "none", or "host"
+    pub network_mode: String,
 }
 
 /// Entry point for the cloned child process.
@@ -54,7 +69,7 @@ extern "C" fn child_entry(arg: *mut libc::c_void) -> libc::c_int {
     match child_main(args) {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("virturust: container init error: {e:#}");
+            eprintln!("corten: container init error: {e:#}");
             1
         }
     }
@@ -97,11 +112,31 @@ fn child_main(args: &ChildArgs) -> Result<()> {
         ));
     }
 
-    // Set up the container's filesystem (mount /proc, /sys, /dev, then pivot_root)
-    crate::filesystem::setup_container_fs(&args.rootfs)?;
+    // Set up the container's filesystem (mount /proc, /sys, /dev, volumes, then pivot_root)
+    crate::filesystem::setup_container_fs(&args.rootfs, &args.volumes)?;
 
     // Bring up loopback networking inside the network namespace
     crate::network::setup_loopback().ok(); // Non-fatal if `ip` command not available
+
+    // Apply environment variables from image config
+    for env_var in &args.env {
+        if let Some((key, value)) = env_var.split_once('=') {
+            // SAFETY: this runs in a single-threaded child process created by clone()
+            // (no other threads exist), so mutating environment variables is safe.
+            unsafe { std::env::set_var(key, value) };
+        }
+    }
+
+    // Apply working directory
+    if !args.working_dir.is_empty() {
+        std::env::set_current_dir(&args.working_dir)
+            .with_context(|| format!("failed to chdir to {}", args.working_dir))?;
+    }
+
+    // Apply user (setgid then setuid — must set gid first)
+    if !args.user.is_empty() {
+        apply_user(&args.user)?;
+    }
 
     // Build the argv for exec
     if args.command.is_empty() {
@@ -123,15 +158,100 @@ fn child_main(args: &ChildArgs) -> Result<()> {
         .chain(std::iter::once(std::ptr::null()))
         .collect();
 
+    // Set up environment for exec (convert to C strings)
+    let c_env: Vec<CString> = std::env::vars()
+        .map(|(k, v)| CString::new(format!("{k}={v}")).expect("invalid env var"))
+        .collect();
+
+    let c_env_ptrs: Vec<*const libc::c_char> = c_env
+        .iter()
+        .map(|s| s.as_ptr())
+        .chain(std::iter::once(std::ptr::null()))
+        .collect();
+
     // exec replaces this process entirely with the target command.
     // If exec returns, it failed.
-    unsafe { libc::execvp(cmd.as_ptr(), c_args_ptrs.as_ptr()) };
+    unsafe { libc::execvpe(cmd.as_ptr(), c_args_ptrs.as_ptr(), c_env_ptrs.as_ptr()) };
 
     Err(anyhow!(
-        "execvp failed for {:?}: {}",
+        "execvpe failed for {:?}: {}",
         args.command[0],
         std::io::Error::last_os_error()
     ))
+}
+
+/// Apply user and group settings before exec.
+///
+/// Supports formats: "uid", "uid:gid", "user", "user:group".
+/// Numeric values are used directly; names are looked up in /etc/passwd and /etc/group.
+fn apply_user(user_spec: &str) -> Result<()> {
+    let (user_part, group_part) = match user_spec.split_once(':') {
+        Some((u, g)) => (u, Some(g)),
+        None => (user_spec, None),
+    };
+
+    // Parse UID (numeric or lookup from /etc/passwd)
+    let uid = if let Ok(uid) = user_part.parse::<u32>() {
+        uid
+    } else {
+        lookup_uid(user_part)?
+    };
+
+    // Parse GID
+    let gid = if let Some(group) = group_part {
+        if let Ok(gid) = group.parse::<u32>() {
+            Some(gid)
+        } else {
+            Some(lookup_gid(group)?)
+        }
+    } else {
+        None
+    };
+
+    // Set GID first (must be done before dropping privileges via setuid)
+    if let Some(gid) = gid {
+        if unsafe { libc::setgid(gid) } != 0 {
+            return Err(anyhow!("setgid({gid}) failed: {}", std::io::Error::last_os_error()));
+        }
+    }
+
+    // Set UID
+    if unsafe { libc::setuid(uid) } != 0 {
+        return Err(anyhow!("setuid({uid}) failed: {}", std::io::Error::last_os_error()));
+    }
+
+    log::info!("switched to user {user_spec} (uid={uid}, gid={gid:?})");
+    Ok(())
+}
+
+/// Look up a UID by username from /etc/passwd.
+fn lookup_uid(username: &str) -> Result<u32> {
+    let passwd = std::fs::read_to_string("/etc/passwd")
+        .context("failed to read /etc/passwd")?;
+    for line in passwd.lines() {
+        let fields: Vec<&str> = line.split(':').collect();
+        if fields.len() >= 3 && fields[0] == username {
+            return fields[2]
+                .parse()
+                .map_err(|_| anyhow!("invalid UID in /etc/passwd for {username}"));
+        }
+    }
+    Err(anyhow!("user '{username}' not found in /etc/passwd"))
+}
+
+/// Look up a GID by group name from /etc/group.
+fn lookup_gid(groupname: &str) -> Result<u32> {
+    let group = std::fs::read_to_string("/etc/group")
+        .context("failed to read /etc/group")?;
+    for line in group.lines() {
+        let fields: Vec<&str> = line.split(':').collect();
+        if fields.len() >= 3 && fields[0] == groupname {
+            return fields[2]
+                .parse()
+                .map_err(|_| anyhow!("invalid GID in /etc/group for {groupname}"));
+        }
+    }
+    Err(anyhow!("group '{groupname}' not found in /etc/group"))
 }
 
 /// Create a new process in fully isolated namespaces using `clone()`.
@@ -159,12 +279,16 @@ pub fn create_namespaced_process(args: ChildArgs) -> Result<i32> {
     // x86_64 stacks grow downward, so we pass the TOP of the allocation
     let stack_top = unsafe { stack.as_mut_ptr().add(STACK_SIZE) };
 
-    let flags = libc::CLONE_NEWPID
+    let mut flags = libc::CLONE_NEWPID
         | libc::CLONE_NEWNS
         | libc::CLONE_NEWUTS
         | libc::CLONE_NEWIPC
-        | libc::CLONE_NEWNET
         | libc::SIGCHLD;
+
+    // "host" mode shares the host network namespace
+    if args.network_mode != "host" {
+        flags |= libc::CLONE_NEWNET;
+    }
 
     // Heap-allocate the args so the pointer is valid in the child's
     // copy-on-write address space

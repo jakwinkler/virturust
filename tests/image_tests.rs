@@ -4,7 +4,7 @@
 //! with #[ignore] to avoid network dependencies in CI. Run them with:
 //! `cargo test -- --ignored`
 
-use virturust::image;
+use corten::image;
 
 #[test]
 fn image_exists_returns_false_for_missing() {

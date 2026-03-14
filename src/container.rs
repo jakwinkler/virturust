@@ -3,11 +3,13 @@
 //! Orchestrates the full lifecycle of a container by combining
 //! all isolation primitives:
 //!
-//! 1. **cgroups** — create resource limits before the container starts
-//! 2. **clone()** — create the container process in new namespaces
-//! 3. **sync** — signal the child after cgroup setup is complete
-//! 4. **wait** — block until the container process exits
-//! 5. **cleanup** — remove cgroup, update container state
+//! 1. **networking** — create bridge, NAT, and DNS before the container starts
+//! 2. **cgroups** — create resource limits before the container starts
+//! 3. **clone()** — create the container process in new namespaces
+//! 4. **network setup** — create veth pair and configure container networking
+//! 5. **sync** — signal the child after cgroup + network setup is complete
+//! 6. **wait** — block until the container process exits
+//! 7. **cleanup** — remove cgroup, network, update container state
 //!
 //! Container state is persisted to disk throughout the lifecycle,
 //! allowing `ps`, `inspect`, and `stop` to query/control containers.
@@ -116,6 +118,31 @@ pub fn run(config: &ContainerConfig) -> Result<i32> {
     )
     .context("failed to save container config")?;
 
+    // Set up per-container writable rootfs using OverlayFS.
+    // lower = image rootfs (read-only, shared), upper = per-container writable layer.
+    // Falls back to a full copy if OverlayFS is not available.
+    let overlay_dir = container_dir.join("overlay");
+    let container_rootfs = if crate::filesystem::setup_overlay(
+        &config.rootfs,
+        &overlay_dir,
+    )
+    .is_ok()
+    {
+        log::info!("using OverlayFS for container rootfs");
+        overlay_dir.join("merged")
+    } else {
+        log::warn!("OverlayFS not available, falling back to rootfs copy");
+        let rootfs_copy = container_dir.join("rootfs");
+        copy_dir_recursive(&config.rootfs, &rootfs_copy)
+            .context("failed to copy image rootfs to container directory")?;
+        rootfs_copy
+    };
+
+    // Set up container DNS (copy host resolv.conf into rootfs)
+    if config.network_mode != "none" {
+        crate::network::setup_container_dns(&container_rootfs).ok();
+    }
+
     // Initial state: created
     let mut state = ContainerState {
         status: ContainerStatus::Created,
@@ -126,6 +153,14 @@ pub fn run(config: &ContainerConfig) -> Result<i32> {
         exit_code: None,
     };
     save_state(&container_dir, &state)?;
+
+    // Set up bridge and NAT before creating the container process
+    if config.network_mode == "bridge" {
+        crate::network::ensure_bridge()
+            .context("failed to set up bridge network")?;
+        crate::network::setup_nat()
+            .context("failed to set up NAT")?;
+    }
 
     // Create cgroup and apply resource limits
     let cgroup = Cgroup::create(&config.id)?;
@@ -152,10 +187,15 @@ pub fn run(config: &ContainerConfig) -> Result<i32> {
 
     // Create the container process in new namespaces
     let child_args = ChildArgs {
-        rootfs: config.rootfs.to_string_lossy().to_string(),
+        rootfs: container_rootfs.to_string_lossy().to_string(),
         hostname: config.hostname.clone(),
         command: config.command.clone(),
         sync_pipe_rd: pipe_rd,
+        volumes: config.volumes.clone(),
+        env: config.env.clone(),
+        working_dir: config.working_dir.clone(),
+        user: config.user.clone(),
+        network_mode: config.network_mode.clone(),
     };
 
     let child_pid = create_namespaced_process(child_args)?;
@@ -166,7 +206,66 @@ pub fn run(config: &ContainerConfig) -> Result<i32> {
     // Add child to cgroup before it starts doing work
     cgroup.add_process(child_pid)?;
 
-    // Signal child that cgroup is ready
+    // Set up container networking (veth pair, IP allocation, routing)
+    let mut container_ip = String::new();
+    let is_named_network = !matches!(config.network_mode.as_str(), "bridge" | "none" | "host");
+
+    if config.network_mode == "bridge" {
+        let container_net = crate::network::setup_container_network(&config.id, child_pid)
+            .context("failed to set up container network")?;
+        container_ip = container_net.ip.clone();
+        log::info!(
+            "container network: IP={}, bridge={}, veth={}",
+            container_net.ip,
+            container_net.bridge,
+            container_net.veth_host
+        );
+
+        // Set up port forwarding
+        if !config.ports.is_empty() {
+            crate::network::setup_port_forwarding(&container_net.ip, &config.ports)
+                .context("failed to set up port forwarding")?;
+        }
+    } else if is_named_network {
+        let container_net = crate::network::setup_container_named_network(
+            &config.network_mode,
+            &config.id,
+            child_pid,
+        )
+        .with_context(|| format!("failed to set up named network '{}'", config.network_mode))?;
+        container_ip = container_net.ip.clone();
+
+        // Register container for DNS resolution
+        crate::network::register_container_in_network(
+            &config.network_mode,
+            &config.name,
+            &container_net.ip,
+        )
+        .ok();
+
+        // Write /etc/hosts for DNS name resolution
+        crate::network::setup_named_network_dns(
+            &container_rootfs,
+            &config.network_mode,
+            &config.name,
+            &container_net.ip,
+        )
+        .ok();
+
+        log::info!(
+            "container network: IP={}, network={}, bridge={}",
+            container_net.ip,
+            config.network_mode,
+            container_net.bridge
+        );
+
+        if !config.ports.is_empty() {
+            crate::network::setup_port_forwarding(&container_net.ip, &config.ports)
+                .context("failed to set up port forwarding")?;
+        }
+    }
+
+    // Signal child that cgroup and network are ready
     unsafe {
         libc::write(pipe_wr, [0u8].as_ptr() as *const libc::c_void, 1);
         libc::close(pipe_wr);
@@ -200,6 +299,24 @@ pub fn run(config: &ContainerConfig) -> Result<i32> {
     state.finished_at = Some(unix_timestamp());
     state.exit_code = Some(exit_code);
     save_state(&container_dir, &state)?;
+
+    // Cleanup port forwarding and container network
+    if !config.ports.is_empty() && !container_ip.is_empty() {
+        crate::network::cleanup_port_forwarding(&container_ip, &config.ports).ok();
+    }
+    if config.network_mode == "bridge" || is_named_network {
+        crate::network::cleanup_container_network(&config.id).ok();
+    }
+    if is_named_network {
+        crate::network::unregister_container_from_network(
+            &config.network_mode,
+            &config.name,
+        )
+        .ok();
+    }
+
+    // Cleanup OverlayFS mount
+    crate::filesystem::cleanup_overlay(&overlay_dir).ok();
 
     // Cleanup cgroup (container state is preserved for inspection)
     cgroup.destroy().ok();
@@ -260,11 +377,51 @@ pub fn stop(container_dir: &Path, timeout_secs: u64) -> Result<()> {
     state.finished_at = Some(unix_timestamp());
     save_state(container_dir, &state)?;
 
+    // Clean up container network
+    if config.network_mode == "bridge" {
+        crate::network::cleanup_container_network(&config.id).ok();
+    }
+
     // Clean up cgroup
     Cgroup::create(&config.id)
         .and_then(|c| c.destroy())
         .ok();
 
     println!("Container '{}' stopped.", config.name);
+    Ok(())
+}
+
+/// Recursively copy a directory tree, preserving permissions.
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
+    fs::create_dir_all(dst)
+        .with_context(|| format!("failed to create {}", dst.display()))?;
+
+    for entry in fs::read_dir(src)
+        .with_context(|| format!("failed to read directory {}", src.display()))?
+    {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+
+        if file_type.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else if file_type.is_symlink() {
+            let link_target = fs::read_link(&src_path)?;
+            std::os::unix::fs::symlink(&link_target, &dst_path).ok();
+        } else {
+            fs::copy(&src_path, &dst_path)
+                .with_context(|| format!(
+                    "failed to copy {} -> {}",
+                    src_path.display(),
+                    dst_path.display()
+                ))?;
+        }
+    }
+
+    // Preserve directory permissions
+    let metadata = fs::metadata(src)?;
+    fs::set_permissions(dst, metadata.permissions())?;
+
     Ok(())
 }

@@ -1,0 +1,27 @@
+# Example: Nginx + PHP application
+# Build with: corten build examples/nginx-php.toml (future feature)
+
+[image]
+name = "my-php-app"
+tag = "1.0"
+
+[base]
+system = "ubuntu"
+version = "22.04"
+
+[packages]
+install = ["nginx", "php8.1-fpm", "php8.1-mysql", "php8.1-mbstring"]
+
+[files]
+copy = [
+    { src = "nginx.conf", dest = "/etc/nginx/sites-available/default" },
+    { src = "src/", dest = "/var/www/html/", owner = "www-data" },
+]
+
+[env]
+APP_ENV = "production"
+
+[container]
+command = ["sh", "-c", "service php8.1-fpm start && nginx -g 'daemon off;'"]
+user = "www-data"
+workdir = "/var/www/html"

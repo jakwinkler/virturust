@@ -1,8 +1,8 @@
-//! # VirtuRust
+//! # Corten
 //!
 //! A lightweight, high-performance container runtime written in Rust.
 //!
-//! VirtuRust provides Docker-like containerization using Linux kernel primitives:
+//! Corten provides Docker-like containerization using Linux kernel primitives:
 //!
 //! - **Namespaces** for process, mount, network, UTS, and IPC isolation
 //! - **cgroups v2** for memory, CPU, and process count limits

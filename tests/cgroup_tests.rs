@@ -24,10 +24,10 @@ fn cgroup_create_and_destroy() {
         return;
     }
 
-    let cgroup = virturust::cgroup::Cgroup::create("test-container-001").unwrap();
+    let cgroup = corten::cgroup::Cgroup::create("test-container-001").unwrap();
 
     // Verify the directory was created
-    assert!(Path::new("/sys/fs/cgroup/virturust/test-container-001").exists());
+    assert!(Path::new("/sys/fs/cgroup/corten/test-container-001").exists());
 
     // Set limits
     cgroup.set_memory_limit(256 * 1024 * 1024).unwrap(); // 256 MiB
@@ -36,20 +36,20 @@ fn cgroup_create_and_destroy() {
 
     // Verify limits were written
     let mem_max =
-        fs::read_to_string("/sys/fs/cgroup/virturust/test-container-001/memory.max").unwrap();
+        fs::read_to_string("/sys/fs/cgroup/corten/test-container-001/memory.max").unwrap();
     assert_eq!(mem_max.trim(), "268435456");
 
     let cpu_max =
-        fs::read_to_string("/sys/fs/cgroup/virturust/test-container-001/cpu.max").unwrap();
+        fs::read_to_string("/sys/fs/cgroup/corten/test-container-001/cpu.max").unwrap();
     assert_eq!(cpu_max.trim(), "50000 100000");
 
     let pids_max =
-        fs::read_to_string("/sys/fs/cgroup/virturust/test-container-001/pids.max").unwrap();
+        fs::read_to_string("/sys/fs/cgroup/corten/test-container-001/pids.max").unwrap();
     assert_eq!(pids_max.trim(), "100");
 
     // Cleanup
     cgroup.destroy().unwrap();
-    assert!(!Path::new("/sys/fs/cgroup/virturust/test-container-001").exists());
+    assert!(!Path::new("/sys/fs/cgroup/corten/test-container-001").exists());
 }
 
 #[test]
@@ -68,10 +68,10 @@ fn cgroup_memory_limit_various_values() {
 
     for (i, (bytes, expected)) in test_values.iter().enumerate() {
         let id = format!("test-mem-{i}");
-        let cgroup = virturust::cgroup::Cgroup::create(&id).unwrap();
+        let cgroup = corten::cgroup::Cgroup::create(&id).unwrap();
         cgroup.set_memory_limit(*bytes).unwrap();
 
-        let actual = fs::read_to_string(format!("/sys/fs/cgroup/virturust/{id}/memory.max"))
+        let actual = fs::read_to_string(format!("/sys/fs/cgroup/corten/{id}/memory.max"))
             .unwrap();
         assert_eq!(actual.trim(), *expected, "memory limit mismatch for {bytes} bytes");
 
@@ -96,10 +96,10 @@ fn cgroup_cpu_limit_various_values() {
 
     for (i, (cpus, expected)) in test_values.iter().enumerate() {
         let id = format!("test-cpu-{i}");
-        let cgroup = virturust::cgroup::Cgroup::create(&id).unwrap();
+        let cgroup = corten::cgroup::Cgroup::create(&id).unwrap();
         cgroup.set_cpu_limit(*cpus).unwrap();
 
-        let actual = fs::read_to_string(format!("/sys/fs/cgroup/virturust/{id}/cpu.max"))
+        let actual = fs::read_to_string(format!("/sys/fs/cgroup/corten/{id}/cpu.max"))
             .unwrap();
         assert_eq!(actual.trim(), *expected, "CPU limit mismatch for {cpus} CPUs");
 
@@ -116,10 +116,10 @@ fn cgroup_pids_limit_values() {
 
     for max in [1u64, 10, 50, 100, 1000, 32768] {
         let id = format!("test-pids-{max}");
-        let cgroup = virturust::cgroup::Cgroup::create(&id).unwrap();
+        let cgroup = corten::cgroup::Cgroup::create(&id).unwrap();
         cgroup.set_pids_limit(max).unwrap();
 
-        let actual = fs::read_to_string(format!("/sys/fs/cgroup/virturust/{id}/pids.max"))
+        let actual = fs::read_to_string(format!("/sys/fs/cgroup/corten/{id}/pids.max"))
             .unwrap();
         assert_eq!(actual.trim(), max.to_string());
 

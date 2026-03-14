@@ -3,8 +3,8 @@
 //! Unit tests verify state serialization and helper functions.
 //! Integration tests (marked #[ignore]) test actual container operations.
 
-use virturust::config::{ContainerState, ContainerStatus, unix_timestamp};
-use virturust::container::is_process_alive;
+use corten::config::{ContainerState, ContainerStatus, unix_timestamp};
+use corten::container::is_process_alive;
 
 #[test]
 fn container_status_display() {
@@ -119,8 +119,8 @@ fn container_state_all_fields_populated() {
 fn find_container_fails_when_no_containers_dir() {
     // Set a nonexistent data dir
     // Safety: test runs single-threaded, no other code reads this var concurrently
-    unsafe { std::env::set_var("VIRTURUST_DATA_DIR", "/tmp/virturust-test-nonexistent") };
-    let result = virturust::container::find_container("anything");
+    unsafe { std::env::set_var("CORTEN_DATA_DIR", "/tmp/corten-test-nonexistent") };
+    let result = corten::container::find_container("anything");
     assert!(result.is_err());
-    unsafe { std::env::remove_var("VIRTURUST_DATA_DIR") };
+    unsafe { std::env::remove_var("CORTEN_DATA_DIR") };
 }

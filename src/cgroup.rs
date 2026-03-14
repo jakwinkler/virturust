@@ -1,8 +1,8 @@
 //! cgroup v2 management for container resource limits.
 //!
-//! VirtuRust uses the unified cgroup v2 hierarchy to enforce resource
+//! Corten uses the unified cgroup v2 hierarchy to enforce resource
 //! constraints on containers. Each container gets its own cgroup under
-//! `/sys/fs/cgroup/virturust/<container-id>/`.
+//! `/sys/fs/cgroup/corten/<container-id>/`.
 //!
 //! ## Supported controllers
 //!
@@ -19,8 +19,8 @@ use std::path::PathBuf;
 /// Root of the cgroup v2 unified hierarchy.
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
-/// Parent cgroup for all VirtuRust containers.
-const VIRTURUST_CGROUP: &str = "virturust";
+/// Parent cgroup for all Corten containers.
+const CORTEN_CGROUP: &str = "corten";
 
 /// CFS period in microseconds (100ms). The quota is calculated relative
 /// to this period: `quota = cpus * period`.
@@ -39,11 +39,11 @@ pub struct Cgroup {
 impl Cgroup {
     /// Create a new cgroup for the given container ID.
     ///
-    /// Creates the directory at `/sys/fs/cgroup/virturust/<id>/`.
-    /// The parent `virturust` directory is also created if it doesn't exist.
+    /// Creates the directory at `/sys/fs/cgroup/corten/<id>/`.
+    /// The parent `corten` directory is also created if it doesn't exist.
     pub fn create(container_id: &str) -> Result<Self> {
         let path = PathBuf::from(CGROUP_ROOT)
-            .join(VIRTURUST_CGROUP)
+            .join(CORTEN_CGROUP)
             .join(container_id);
 
         fs::create_dir_all(&path)

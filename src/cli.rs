@@ -1,22 +1,22 @@
-//! Command-line interface definitions for VirtuRust.
+//! Command-line interface definitions for Corten.
 //!
 //! Uses `clap` with derive macros for a clean, self-documenting CLI.
 //! All subcommands and their arguments are defined here.
 
 use clap::{Parser, Subcommand};
 
-/// VirtuRust — A lightweight container runtime written in Rust.
+/// Corten — A lightweight container runtime written in Rust.
 ///
 /// Run Linux containers with minimal overhead using kernel namespaces,
 /// cgroups v2, and pivot_root for filesystem isolation.
 #[derive(Parser, Debug)]
-#[command(name = "virturust", version, about, long_about = None)]
+#[command(name = "corten", version, about, long_about = None)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
 
     /// Enable verbose/debug logging
-    #[arg(short, long, global = true)]
+    #[arg(long, global = true)]
     pub verbose: bool,
 }
 
@@ -42,6 +42,9 @@ pub enum Commands {
 
     /// Remove a stopped container
     Rm(RmArgs),
+
+    /// Manage networks
+    Network(NetworkArgs),
 }
 
 /// Arguments for the `run` subcommand.
@@ -78,6 +81,20 @@ pub struct RunArgs {
     /// Human-readable container name (defaults to a short container ID)
     #[arg(long)]
     pub name: Option<String>,
+
+    /// Bind mount a host directory into the container.
+    /// Format: /host/path:/container/path[:ro]
+    #[arg(short = 'v', long = "volume")]
+    pub volumes: Vec<String>,
+
+    /// Network mode: bridge (default), none, or host
+    #[arg(long, default_value = "bridge")]
+    pub network: String,
+
+    /// Publish a container port to the host.
+    /// Format: host_port:container_port or ip:host_port:container_port
+    #[arg(short = 'p', long = "publish")]
+    pub publish: Vec<String>,
 }
 
 /// Arguments for the `pull` subcommand.
@@ -109,5 +126,36 @@ pub struct InspectArgs {
 #[derive(clap::Args, Debug)]
 pub struct RmArgs {
     /// Container name or ID to remove
+    pub name: String,
+}
+
+/// Arguments for the `network` subcommand.
+#[derive(clap::Args, Debug)]
+pub struct NetworkArgs {
+    #[command(subcommand)]
+    pub command: NetworkCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum NetworkCommands {
+    /// Create a named network
+    Create(NetworkCreateArgs),
+    /// List networks
+    Ls,
+    /// Remove a network
+    Rm(NetworkRmArgs),
+}
+
+/// Arguments for `network create`.
+#[derive(clap::Args, Debug)]
+pub struct NetworkCreateArgs {
+    /// Name for the network
+    pub name: String,
+}
+
+/// Arguments for `network rm`.
+#[derive(clap::Args, Debug)]
+pub struct NetworkRmArgs {
+    /// Name of the network to remove
     pub name: String,
 }

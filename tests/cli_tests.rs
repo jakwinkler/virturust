@@ -5,35 +5,35 @@
 
 // Test the CLI via the compiled binary to verify end-to-end argument parsing.
 
-/// Helper to run the virturust binary with args and capture output.
-fn run_virturust(args: &[&str]) -> std::process::Output {
-    std::process::Command::new(env!("CARGO_BIN_EXE_virturust"))
+/// Helper to run the corten binary with args and capture output.
+fn run_corten(args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_corten"))
         .args(args)
         .output()
-        .expect("failed to execute virturust binary")
+        .expect("failed to execute corten binary")
 }
 
 #[test]
 fn cli_help_exits_successfully() {
-    let output = run_virturust(&["--help"]);
+    let output = run_corten(&["--help"]);
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("virturust"));
+    assert!(stdout.contains("corten"));
     assert!(stdout.contains("container runtime"));
 }
 
 #[test]
 fn cli_version_exits_successfully() {
-    let output = run_virturust(&["--version"]);
+    let output = run_corten(&["--version"]);
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("virturust"));
+    assert!(stdout.contains("corten"));
     assert!(stdout.contains("0.1.0"));
 }
 
 #[test]
 fn cli_run_help_shows_options() {
-    let output = run_virturust(&["run", "--help"]);
+    let output = run_corten(&["run", "--help"]);
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("--memory"));
@@ -41,11 +41,12 @@ fn cli_run_help_shows_options() {
     assert!(stdout.contains("--pids-limit"));
     assert!(stdout.contains("--hostname"));
     assert!(stdout.contains("--name"));
+    assert!(stdout.contains("--volume"));
 }
 
 #[test]
 fn cli_pull_help_shows_usage() {
-    let output = run_virturust(&["pull", "--help"]);
+    let output = run_corten(&["pull", "--help"]);
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Pull an image"));
@@ -53,7 +54,7 @@ fn cli_pull_help_shows_usage() {
 
 #[test]
 fn cli_no_subcommand_shows_help() {
-    let output = run_virturust(&[]);
+    let output = run_corten(&[]);
     // Should fail with usage info
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -62,13 +63,13 @@ fn cli_no_subcommand_shows_help() {
 
 #[test]
 fn cli_unknown_subcommand_fails() {
-    let output = run_virturust(&["nonexistent"]);
+    let output = run_corten(&["nonexistent"]);
     assert!(!output.status.success());
 }
 
 #[test]
 fn cli_images_help() {
-    let output = run_virturust(&["images", "--help"]);
+    let output = run_corten(&["images", "--help"]);
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("List locally available images"));
@@ -76,13 +77,13 @@ fn cli_images_help() {
 
 #[test]
 fn cli_ps_help() {
-    let output = run_virturust(&["ps", "--help"]);
+    let output = run_corten(&["ps", "--help"]);
     assert!(output.status.success());
 }
 
 #[test]
 fn cli_rm_help() {
-    let output = run_virturust(&["rm", "--help"]);
+    let output = run_corten(&["rm", "--help"]);
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Remove"));
@@ -90,37 +91,39 @@ fn cli_rm_help() {
 
 #[test]
 fn cli_rm_requires_name() {
-    let output = run_virturust(&["rm"]);
+    let output = run_corten(&["rm"]);
     assert!(!output.status.success());
 }
 
 #[test]
 fn cli_pull_requires_image() {
-    let output = run_virturust(&["pull"]);
+    let output = run_corten(&["pull"]);
     assert!(!output.status.success());
 }
 
 #[test]
 fn cli_run_requires_image() {
-    let output = run_virturust(&["run"]);
+    let output = run_corten(&["run"]);
     assert!(!output.status.success());
 }
 
 #[test]
 fn cli_verbose_flag_accepted() {
-    let output = run_virturust(&["--verbose", "--help"]);
+    let output = run_corten(&["--verbose", "--help"]);
     assert!(output.status.success());
 }
 
 #[test]
-fn cli_verbose_short_flag_accepted() {
-    let output = run_virturust(&["-v", "--help"]);
-    assert!(output.status.success());
+fn cli_volume_short_flag_accepted() {
+    // -v is now the volume flag, not verbose
+    let output = run_corten(&["run", "--help"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("-v"));
 }
 
 #[test]
 fn cli_stop_help() {
-    let output = run_virturust(&["stop", "--help"]);
+    let output = run_corten(&["stop", "--help"]);
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Stop"));
@@ -129,13 +132,13 @@ fn cli_stop_help() {
 
 #[test]
 fn cli_stop_requires_name() {
-    let output = run_virturust(&["stop"]);
+    let output = run_corten(&["stop"]);
     assert!(!output.status.success());
 }
 
 #[test]
 fn cli_inspect_help() {
-    let output = run_virturust(&["inspect", "--help"]);
+    let output = run_corten(&["inspect", "--help"]);
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("detailed"));
@@ -143,13 +146,13 @@ fn cli_inspect_help() {
 
 #[test]
 fn cli_inspect_requires_name() {
-    let output = run_virturust(&["inspect"]);
+    let output = run_corten(&["inspect"]);
     assert!(!output.status.success());
 }
 
 #[test]
 fn cli_stop_default_timeout() {
-    let output = run_virturust(&["stop", "--help"]);
+    let output = run_corten(&["stop", "--help"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("10"));
 }

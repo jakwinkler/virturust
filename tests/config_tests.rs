@@ -1,6 +1,6 @@
 //! Tests for configuration parsing and validation.
 
-use virturust::config::{parse_image_ref, parse_memory};
+use corten::config::{parse_image_ref, parse_memory};
 
 // =============================================================================
 // parse_memory tests

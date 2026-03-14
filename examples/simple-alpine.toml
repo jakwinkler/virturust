@@ -1,0 +1,16 @@
+# Example: Minimal Alpine container
+# Build with: corten build examples/simple-alpine.toml (future feature)
+
+[image]
+name = "my-alpine"
+tag = "latest"
+
+[base]
+system = "alpine"
+version = "3.19"
+
+[packages]
+install = ["curl", "jq", "bash"]
+
+[container]
+command = ["/bin/bash"]

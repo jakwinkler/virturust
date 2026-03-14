@@ -1,0 +1,23 @@
+# Example: PostgreSQL database
+# Build with: corten build examples/postgres.toml (future feature)
+
+[image]
+name = "my-postgres"
+tag = "16"
+
+[base]
+system = "ubuntu"
+version = "22.04"
+
+[packages]
+install = ["postgresql-16"]
+
+[files]
+copy = [
+    { src = "postgresql.conf", dest = "/etc/postgresql/16/main/postgresql.conf", owner = "postgres" },
+    { src = "pg_hba.conf", dest = "/etc/postgresql/16/main/pg_hba.conf", owner = "postgres" },
+]
+
+[container]
+command = ["postgres", "-D", "/var/lib/postgresql/16/main"]
+user = "postgres"
