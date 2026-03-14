@@ -222,19 +222,23 @@ pub fn setup_nat() -> Result<()> {
 pub fn setup_container_network(container_id: &str, child_pid: i32) -> Result<ContainerNetwork> {
     let short_id = &container_id[..8];
     let veth_host = format!("veth-{short_id}");
-    let veth_container = "eth0";
+    // Use unique peer name in host namespace, rename to eth0 inside container
+    let veth_peer = format!("peer-{short_id}");
 
     log::info!("setting up network for container {short_id} (PID {child_pid})");
 
-    // 1. Create the veth pair
+    // Clean up stale veth if exists from a crashed run
+    run_cmd("ip", &["link", "del", &veth_host]).ok();
+
+    // 1. Create the veth pair (both names unique in host namespace)
     run_cmd(
         "ip",
         &[
             "link", "add", &veth_host, "type", "veth",
-            "peer", "name", veth_container,
+            "peer", "name", &veth_peer,
         ],
     )
-    .with_context(|| format!("failed to create veth pair {veth_host} <-> {veth_container}"))?;
+    .with_context(|| format!("failed to create veth pair {veth_host} <-> {veth_peer}"))?;
 
     // 2. Attach host side to the bridge
     run_cmd("ip", &["link", "set", &veth_host, "master", BRIDGE_NAME])
@@ -244,45 +248,44 @@ pub fn setup_container_network(container_id: &str, child_pid: i32) -> Result<Con
     run_cmd("ip", &["link", "set", &veth_host, "up"])
         .with_context(|| format!("failed to bring up {veth_host}"))?;
 
-    // 4. Move the container side into the container's network namespace
+    // 4. Move the peer into the container's network namespace
     let pid_str = child_pid.to_string();
     run_cmd(
         "ip",
-        &["link", "set", veth_container, "netns", &pid_str],
+        &["link", "set", &veth_peer, "netns", &pid_str],
     )
     .with_context(|| {
-        format!("failed to move {veth_container} into namespace of PID {child_pid}")
+        format!("failed to move {veth_peer} into namespace of PID {child_pid}")
     })?;
 
-    // 5. Allocate an IP address
+    // 5. Rename peer to eth0 inside the container namespace
+    let ns_path = format!("/proc/{child_pid}/ns/net");
+    run_cmd(
+        "nsenter",
+        &["--net", &ns_path, "ip", "link", "set", &veth_peer, "name", "eth0"],
+    )
+    .with_context(|| format!("failed to rename {veth_peer} to eth0 in container"))?;
+
+    // 6. Allocate an IP address
     let ip = allocate_ip().context("failed to allocate container IP")?;
     let ip_cidr = format!("{ip}/24");
 
-    // 6. Configure the container side (runs inside the container's netns via nsenter)
+    // 7. Configure eth0 inside the container namespace
     run_cmd(
         "nsenter",
-        &[
-            "--net", &format!("/proc/{child_pid}/ns/net"),
-            "ip", "addr", "add", &ip_cidr, "dev", veth_container,
-        ],
+        &["--net", &ns_path, "ip", "addr", "add", &ip_cidr, "dev", "eth0"],
     )
-    .with_context(|| format!("failed to assign {ip_cidr} to {veth_container}"))?;
+    .with_context(|| format!("failed to assign {ip_cidr} to eth0"))?;
 
     run_cmd(
         "nsenter",
-        &[
-            "--net", &format!("/proc/{child_pid}/ns/net"),
-            "ip", "link", "set", veth_container, "up",
-        ],
+        &["--net", &ns_path, "ip", "link", "set", "eth0", "up"],
     )
-    .with_context(|| format!("failed to bring up {veth_container} in container"))?;
+    .with_context(|| "failed to bring up eth0 in container".to_string())?;
 
     run_cmd(
         "nsenter",
-        &[
-            "--net", &format!("/proc/{child_pid}/ns/net"),
-            "ip", "route", "add", "default", "via", BRIDGE_IP,
-        ],
+        &["--net", &ns_path, "ip", "route", "add", "default", "via", BRIDGE_IP],
     )
     .with_context(|| format!("failed to add default route via {BRIDGE_IP}"))?;
 
