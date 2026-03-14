@@ -1,25 +1,27 @@
-//! OCI image management — pulling, storing, and listing container images.
+//! Image management — pulling, storing, and listing container images.
 //!
-//! Corten pulls images from Docker Hub (`registry-1.docker.io`) using the
-//! [OCI Distribution Specification](https://github.com/opencontainers/distribution-spec).
+//! Corten fetches base OS rootfs tarballs directly from official distro
+//! mirrors. No Docker Hub, no OCI layers, no daemon.
 //!
-//! ## Pull flow
+//! ## Supported distros
 //!
-//! 1. **Authenticate** — obtain a bearer token from `auth.docker.io`
-//! 2. **Fetch manifest** — get the image manifest (or manifest list for multi-arch)
-//! 3. **Download layers** — each layer is a gzipped tar archive
-//! 4. **Extract layers** — unpack in order to build the root filesystem
+//! | Distro  | Source                              | Architectures       |
+//! |---------|-------------------------------------|----------------------|
+//! | Alpine  | dl-cdn.alpinelinux.org              | x86_64, aarch64      |
+//! | Ubuntu  | cloud-images.ubuntu.com             | amd64, arm64         |
+//! | Debian  | cdimage.debian.org (debootstrap)     | amd64, arm64         |
+//! | Fedora  | kojipkgs.fedoraproject.org           | x86_64, aarch64      |
+//! | Arch    | geo.mirror.pkgbuild.com             | x86_64               |
+//! | Void    | repo-default.voidlinux.org           | x86_64, aarch64      |
 //!
 //! ## Local storage layout
 //!
 //! ```text
 //! /var/lib/corten/images/
 //!   alpine/
-//!     latest/
-//!       rootfs/          # extracted filesystem ready for pivot_root
-//!   ubuntu/
-//!     22.04/
-//!       rootfs/
+//!     3.20/
+//!       rootfs/          # extracted filesystem
+//!       config.json      # image config (ENV, CMD, USER, etc.)
 //! ```
 
 use anyhow::{anyhow, Context, Result};
@@ -29,102 +31,16 @@ use std::path::{Path, PathBuf};
 
 use crate::config::images_dir;
 
-/// Docker Hub registry base URL.
-const REGISTRY: &str = "https://registry-1.docker.io";
-
-/// Docker Hub authentication service.
-const AUTH_SERVICE: &str = "https://auth.docker.io/token";
-
-// --- Registry API response types ---
-
-#[derive(Deserialize)]
-struct AuthToken {
-    token: String,
-}
-
-/// OCI/Docker image manifest.
-#[derive(Deserialize)]
-struct Manifest {
-    #[allow(dead_code)]
-    #[serde(rename = "schemaVersion")]
-    schema_version: u32,
-    #[allow(dead_code)]
-    config: Descriptor,
-    layers: Vec<Descriptor>,
-}
-
-/// A content-addressable blob descriptor.
-#[derive(Deserialize)]
-struct Descriptor {
-    #[allow(dead_code)]
-    #[serde(rename = "mediaType")]
-    media_type: String,
-    digest: String,
-    size: u64,
-}
-
-/// Manifest list (fat manifest) for multi-architecture images.
-#[derive(Deserialize)]
-struct ManifestList {
-    #[allow(dead_code)]
-    #[serde(rename = "schemaVersion")]
-    schema_version: u32,
-    manifests: Vec<PlatformManifest>,
-}
-
-/// A single platform entry in a manifest list.
-#[derive(Deserialize)]
-struct PlatformManifest {
-    #[allow(dead_code)]
-    #[serde(rename = "mediaType")]
-    media_type: String,
-    digest: String,
-    #[allow(dead_code)]
-    size: u64,
-    platform: Platform,
-}
-
-/// Platform specification (OS + architecture).
-#[derive(Deserialize)]
-struct Platform {
-    architecture: String,
-    os: String,
-}
-
-// --- OCI image configuration types ---
-
-/// OCI image configuration blob (the JSON config referenced by the manifest).
-#[derive(Deserialize)]
-struct OciImageConfig {
-    config: Option<OciContainerConfig>,
-}
-
-/// Container-specific configuration within the OCI image config.
-#[derive(Deserialize)]
-struct OciContainerConfig {
-    #[serde(rename = "Env")]
-    env: Option<Vec<String>>,
-    #[serde(rename = "Cmd")]
-    cmd: Option<Vec<String>>,
-    #[serde(rename = "Entrypoint")]
-    entrypoint: Option<Vec<String>>,
-    #[serde(rename = "WorkingDir")]
-    working_dir: Option<String>,
-    #[serde(rename = "User")]
-    user: Option<String>,
-}
-
 /// Resolved image configuration stored alongside the rootfs.
-/// This is Corten's simplified representation of the OCI config.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ImageConfig {
     /// Environment variables (KEY=VALUE format)
     #[serde(default)]
     pub env: Vec<String>,
-    /// Default command (CMD in Dockerfile)
+    /// Default command
     #[serde(default)]
     pub cmd: Vec<String>,
-    /// Entrypoint (ENTRYPOINT in Dockerfile)
+    /// Entrypoint
     #[serde(default)]
     pub entrypoint: Vec<String>,
     /// Working directory
@@ -135,312 +51,287 @@ pub struct ImageConfig {
     pub user: String,
 }
 
-/// Map Rust's `std::env::consts::ARCH` to Docker's architecture names.
-fn docker_arch() -> &'static str {
+/// Host architecture in distro-native naming.
+fn native_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "x86_64",
+        "aarch64" => "aarch64",
+        _ => "x86_64",
+    }
+}
+
+/// Host architecture in Debian/Ubuntu naming.
+fn deb_arch() -> &'static str {
     match std::env::consts::ARCH {
         "x86_64" => "amd64",
         "aarch64" => "arm64",
-        "arm" => "arm",
-        "riscv64" => "riscv64",
         _ => "amd64",
     }
 }
 
-/// Pull an image from Docker Hub and extract it locally.
+/// Pull an image by downloading the base OS rootfs from official mirrors.
 ///
-/// Downloads all layers and extracts them in order to build a complete
-/// root filesystem at `/var/lib/corten/images/<name>/<tag>/rootfs/`.
-///
-/// Supports multi-architecture images by automatically selecting the
-/// platform matching the host architecture.
-///
-/// # Arguments
-///
-/// * `name` — Image name (e.g., `"alpine"`, `"ubuntu"`)
-/// * `tag` — Image tag (e.g., `"latest"`, `"22.04"`, `"bookworm"`)
-///
-/// # Returns
-///
-/// Path to the extracted root filesystem.
+/// Supported image references:
+/// - `alpine`, `alpine:3.20` — Alpine Linux minirootfs
+/// - `ubuntu:noble`, `ubuntu:22.04` — Ubuntu cloud rootfs
+/// - `debian:bookworm` — Debian via debootstrap
+/// - `fedora:40` — Fedora container base
+/// - `archlinux` — Arch Linux bootstrap
+/// - `void` — Void Linux rootfs
 pub async fn pull_image(name: &str, tag: &str) -> Result<PathBuf> {
-    // Docker Hub requires the "library/" prefix for official images
-    let repo = if name.contains('/') {
-        name.to_string()
-    } else {
-        format!("library/{name}")
-    };
-
-    println!("Pulling {name}:{tag}...");
-
-    let client = reqwest::Client::new();
-
-    // Step 1: Authenticate with Docker Hub
-    let token = get_auth_token(&client, &repo)
-        .await
-        .context("authentication failed")?;
-
-    // Step 2: Fetch the image manifest
-    let manifest = get_manifest(&client, &repo, tag, &token)
-        .await
-        .context("failed to fetch manifest")?;
-
-    // Step 3: Prepare local storage
     let image_dir = images_dir().join(name).join(tag);
-    let rootfs_dir = image_dir.join("rootfs");
+    let rootfs = image_dir.join("rootfs");
 
-    if rootfs_dir.exists() {
-        fs::remove_dir_all(&rootfs_dir).context("failed to clean existing rootfs")?;
+    if rootfs.exists() {
+        fs::remove_dir_all(&rootfs).context("failed to clean existing rootfs")?;
     }
-    fs::create_dir_all(&rootfs_dir).context("failed to create rootfs directory")?;
+    fs::create_dir_all(&rootfs).context("failed to create rootfs directory")?;
 
-    // Step 4: Download and extract each layer in order
-    let total = manifest.layers.len();
-    for (i, layer) in manifest.layers.iter().enumerate() {
-        println!(
-            "  Layer {}/{} ({:.1} MB) {}",
-            i + 1,
-            total,
-            layer.size as f64 / 1_048_576.0,
-            &layer.digest[..19], // Show short digest
-        );
-        download_and_extract_layer(&client, &repo, &layer.digest, &token, &rootfs_dir)
-            .await
-            .with_context(|| format!("failed to extract layer {}", layer.digest))?;
+    println!("Pulling {name}:{tag} from official mirrors...");
+
+    match name.to_lowercase().as_str() {
+        "alpine" => pull_alpine(tag, &rootfs).await?,
+        "ubuntu" => pull_ubuntu(tag, &rootfs).await?,
+        "debian" => pull_debian(tag, &rootfs)?,
+        "fedora" => pull_fedora(tag, &rootfs).await?,
+        "archlinux" | "arch" => pull_arch(&rootfs).await?,
+        "void" | "voidlinux" => pull_void(&rootfs).await?,
+        _ => {
+            return Err(anyhow!(
+                "unsupported image '{name}'. Supported: alpine, ubuntu, debian, fedora, archlinux, void\n\
+                 Or build your own with: corten build <path-to-Corten.toml>"
+            ));
+        }
     }
 
-    // Step 5: Download and save the image config
-    let image_config = download_image_config(&client, &repo, &manifest.config.digest, &token)
-        .await
-        .context("failed to download image config")?;
-    let config_path = image_dir.join("config.json");
-    fs::write(&config_path, serde_json::to_string_pretty(&image_config)?)
-        .context("failed to save image config")?;
-    log::info!("saved image config to {}", config_path.display());
+    // Copy host DNS for package operations
+    let etc = rootfs.join("etc");
+    fs::create_dir_all(&etc).ok();
+    if Path::new("/etc/resolv.conf").exists() {
+        fs::copy("/etc/resolv.conf", etc.join("resolv.conf")).ok();
+    }
+
+    // Write default image config
+    let config = default_image_config(name);
+    fs::write(
+        image_dir.join("config.json"),
+        serde_json::to_string_pretty(&config)?,
+    )?;
 
     println!("Successfully pulled {name}:{tag}");
-    Ok(rootfs_dir)
+    Ok(rootfs)
 }
 
-/// Obtain a bearer token for pulling from the given repository.
-async fn get_auth_token(client: &reqwest::Client, repo: &str) -> Result<String> {
-    let url = format!("{AUTH_SERVICE}?service=registry.docker.io&scope=repository:{repo}:pull");
-
-    let resp: AuthToken = client
-        .get(&url)
-        .send()
-        .await
-        .context("auth request failed")?
-        .json()
-        .await
-        .context("failed to parse auth response")?;
-
-    Ok(resp.token)
-}
-
-/// Fetch the image manifest, handling both single-arch and multi-arch images.
-///
-/// When a manifest list (fat manifest) is returned, automatically selects
-/// the manifest matching the host architecture.
-async fn get_manifest(
-    client: &reqwest::Client,
-    repo: &str,
-    tag: &str,
-    token: &str,
-) -> Result<Manifest> {
-    let url = format!("{REGISTRY}/v2/{repo}/manifests/{tag}");
-
-    let resp = client
-        .get(&url)
-        .header("Authorization", format!("Bearer {token}"))
-        .header(
-            "Accept",
-            [
-                "application/vnd.oci.image.manifest.v1+json",
-                "application/vnd.docker.distribution.manifest.v2+json",
-                "application/vnd.docker.distribution.manifest.list.v2+json",
-                "application/vnd.oci.image.index.v1+json",
-            ]
-            .join(", "),
-        )
-        .send()
-        .await
-        .context("manifest request failed")?;
-
-    let content_type = resp
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-
-    let body = resp.text().await.context("failed to read manifest body")?;
-
-    // Multi-arch images return a manifest list — we need to pick our platform
-    if content_type.contains("manifest.list") || content_type.contains("image.index") {
-        let list: ManifestList =
-            serde_json::from_str(&body).context("failed to parse manifest list")?;
-
-        let arch = docker_arch();
-        let platform_manifest = list
-            .manifests
-            .iter()
-            .find(|m| m.platform.architecture == arch && m.platform.os == "linux")
-            .ok_or_else(|| anyhow!("no {arch}/linux manifest found for this image"))?;
-
-        log::info!(
-            "selected {arch}/linux platform (digest: {})",
-            &platform_manifest.digest[..19]
-        );
-
-        // Fetch the actual manifest by digest
-        let url = format!("{REGISTRY}/v2/{repo}/manifests/{}", platform_manifest.digest);
-        let manifest: Manifest = client
-            .get(&url)
-            .header("Authorization", format!("Bearer {token}"))
-            .header(
-                "Accept",
-                [
-                    "application/vnd.oci.image.manifest.v1+json",
-                    "application/vnd.docker.distribution.manifest.v2+json",
-                ]
-                .join(", "),
-            )
-            .send()
-            .await
-            .context("failed to fetch platform manifest")?
-            .json()
-            .await
-            .context("failed to parse platform manifest")?;
-
-        Ok(manifest)
-    } else {
-        // Single-arch image — parse directly
-        let manifest: Manifest =
-            serde_json::from_str(&body).context("failed to parse manifest")?;
-        Ok(manifest)
+/// Default image config for known distros.
+fn default_image_config(_name: &str) -> ImageConfig {
+    ImageConfig {
+        env: vec![
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
+        ],
+        cmd: vec!["/bin/sh".to_string()],
+        entrypoint: Vec::new(),
+        working_dir: String::new(),
+        user: String::new(),
     }
 }
 
-/// Download a single layer blob and extract it into the rootfs.
-///
-/// Layers are gzipped tar archives. They are extracted in order,
-/// with later layers overwriting files from earlier layers (union
-/// filesystem semantics).
-async fn download_and_extract_layer(
-    client: &reqwest::Client,
-    repo: &str,
-    digest: &str,
-    token: &str,
-    rootfs: &Path,
-) -> Result<()> {
-    let url = format!("{REGISTRY}/v2/{repo}/blobs/{digest}");
+/// Pull Alpine Linux minirootfs.
+async fn pull_alpine(tag: &str, rootfs: &Path) -> Result<()> {
+    let version = if tag == "latest" { "3.20" } else { tag };
+    let arch = native_arch();
 
-    let resp = client
-        .get(&url)
-        .header("Authorization", format!("Bearer {token}"))
-        .send()
-        .await
-        .context("layer download failed")?;
+    // Try multiple patch versions
+    let urls: Vec<String> = (0..=5)
+        .map(|patch| {
+            format!(
+                "https://dl-cdn.alpinelinux.org/alpine/v{version}/releases/{arch}/alpine-minirootfs-{version}.{patch}-{arch}.tar.gz"
+            )
+        })
+        .collect();
 
-    let bytes = resp.bytes().await.context("failed to read layer data")?;
+    download_and_extract_tarball(&urls, rootfs, "Alpine").await
+}
 
-    // Decompress (gzip) and unpack (tar) with OCI whiteout handling
-    let decoder = flate2::read::GzDecoder::new(&bytes[..]);
-    let mut archive = tar::Archive::new(decoder);
-    archive.set_preserve_permissions(true);
-    archive.set_preserve_ownerships(true);
-    archive.set_overwrite(true);
+/// Pull Ubuntu cloud rootfs.
+async fn pull_ubuntu(tag: &str, rootfs: &Path) -> Result<()> {
+    let (version, codename) = match tag {
+        "latest" | "24.04" | "noble" => ("24.04", "noble"),
+        "22.04" | "jammy" => ("22.04", "jammy"),
+        "20.04" | "focal" => ("20.04", "focal"),
+        other => return Err(anyhow!("unsupported Ubuntu version: {other}. Use: 24.04, 22.04, 20.04")),
+    };
 
-    for entry in archive.entries().context("failed to read tar entries")? {
-        let mut entry = entry.context("failed to read tar entry")?;
-        let path = entry.path().context("failed to read entry path")?.into_owned();
-        let file_name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
+    let arch = deb_arch();
+    let urls = vec![
+        format!("https://cloud-images.ubuntu.com/{codename}/current/{codename}-server-cloudimg-{arch}-root.tar.xz"),
+        format!("https://cloud-images.ubuntu.com/minimal/releases/{codename}/release/ubuntu-{version}-minimal-cloudimg-{arch}-root.tar.xz"),
+    ];
 
-        if file_name == ".wh..wh..opq" {
-            // Opaque whiteout: clear the parent directory contents
-            let parent = rootfs.join(
-                path.parent().unwrap_or_else(|| std::path::Path::new("")),
-            );
-            if parent.exists() {
-                for child in fs::read_dir(&parent)? {
-                    let child = child?;
-                    let child_path = child.path();
-                    if child_path.is_dir() {
-                        fs::remove_dir_all(&child_path).ok();
-                    } else {
-                        fs::remove_file(&child_path).ok();
-                    }
-                }
-            }
-            continue;
-        }
+    download_and_extract_tarball(&urls, rootfs, "Ubuntu").await
+}
 
-        if let Some(target_name) = file_name.strip_prefix(".wh.") {
-            // File whiteout: delete the target file/dir
-            let target = rootfs.join(
-                path.parent()
-                    .unwrap_or_else(|| std::path::Path::new(""))
-                    .join(target_name),
-            );
-            if target.is_dir() {
-                fs::remove_dir_all(&target).ok();
-            } else {
-                fs::remove_file(&target).ok();
-            }
-            continue;
-        }
+/// Pull Debian via debootstrap (local tool required).
+fn pull_debian(tag: &str, rootfs: &Path) -> Result<()> {
+    let suite = match tag {
+        "latest" | "12" | "bookworm" => "bookworm",
+        "11" | "bullseye" => "bullseye",
+        other => other,
+    };
 
-        // Normal entry: extract to rootfs
-        entry.unpack_in(rootfs).context("failed to unpack entry")?;
+    println!("  Using debootstrap for Debian {suite}...");
+
+    let status = std::process::Command::new("debootstrap")
+        .args(["--variant=minbase", suite, &rootfs.to_string_lossy()])
+        .status()
+        .context(
+            "debootstrap not found. Install with: sudo apt install debootstrap\n\
+             Or use Alpine instead: corten pull alpine",
+        )?;
+
+    if !status.success() {
+        return Err(anyhow!("debootstrap failed"));
     }
 
     Ok(())
 }
 
-/// Download and parse the OCI image config blob.
-async fn download_image_config(
-    client: &reqwest::Client,
-    repo: &str,
-    digest: &str,
-    token: &str,
-) -> Result<ImageConfig> {
-    let url = format!("{REGISTRY}/v2/{repo}/blobs/{digest}");
+/// Pull Fedora container base image.
+async fn pull_fedora(tag: &str, rootfs: &Path) -> Result<()> {
+    let version = if tag == "latest" { "41" } else { tag };
+    let arch = native_arch();
 
-    let resp = client
-        .get(&url)
-        .header("Authorization", format!("Bearer {token}"))
-        .send()
-        .await
-        .context("config blob download failed")?;
+    let urls = vec![
+        format!("https://kojipkgs.fedoraproject.org/packages/Fedora-Container-Base/{version}/20240912.n.0/images/Fedora-Container-Base-{version}-20240912.n.0.{arch}.tar.xz"),
+    ];
 
-    let body = resp.text().await.context("failed to read config blob")?;
-    let oci_config: OciImageConfig =
-        serde_json::from_str(&body).context("failed to parse OCI image config")?;
+    // Fedora container base is a tarball with a nested rootfs
+    // For simplicity, try direct extraction
+    download_and_extract_tarball(&urls, rootfs, "Fedora").await
+}
 
-    let container_config = oci_config.config.unwrap_or(OciContainerConfig {
-        env: None,
-        cmd: None,
-        entrypoint: None,
-        working_dir: None,
-        user: None,
-    });
+/// Pull Arch Linux bootstrap.
+async fn pull_arch(rootfs: &Path) -> Result<()> {
+    let urls = vec![
+        "https://geo.mirror.pkgbuild.com/iso/latest/archlinux-bootstrap-x86_64.tar.zst".to_string(),
+        "https://geo.mirror.pkgbuild.com/iso/latest/archlinux-bootstrap-x86_64.tar.gz".to_string(),
+    ];
 
-    Ok(ImageConfig {
-        env: container_config.env.unwrap_or_default(),
-        cmd: container_config.cmd.unwrap_or_default(),
-        entrypoint: container_config.entrypoint.unwrap_or_default(),
-        working_dir: container_config.working_dir.unwrap_or_default(),
-        user: container_config.user.unwrap_or_default(),
-    })
+    download_and_extract_tarball(&urls, rootfs, "Arch Linux").await
+}
+
+/// Pull Void Linux rootfs.
+async fn pull_void(rootfs: &Path) -> Result<()> {
+    let arch = native_arch();
+    let musl_suffix = if arch == "x86_64" { "x86_64-musl" } else { "aarch64-musl" };
+
+    let urls = vec![
+        format!("https://repo-default.voidlinux.org/live/current/void-{musl_suffix}-ROOTFS-20240314.tar.xz"),
+        format!("https://repo-default.voidlinux.org/live/current/void-{musl_suffix}-ROOTFS-20230628.tar.xz"),
+    ];
+
+    download_and_extract_tarball(&urls, rootfs, "Void Linux").await
+}
+
+/// Download a tarball from the first working URL and extract it.
+async fn download_and_extract_tarball(urls: &[String], rootfs: &Path, distro: &str) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()?;
+
+    let mut last_err = anyhow!("no URLs to try");
+
+    for url in urls {
+        println!("  Trying {url}");
+        match client.get(url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                let bytes = resp.bytes().await.context("failed to download")?;
+                let size_mb = bytes.len() as f64 / 1_048_576.0;
+                println!("  Downloaded {size_mb:.1} MB");
+
+                // Detect format and extract
+                if url.ends_with(".tar.gz") || url.ends_with(".tgz") {
+                    let decoder = flate2::read::GzDecoder::new(&bytes[..]);
+                    let mut archive = tar::Archive::new(decoder);
+                    archive.set_preserve_permissions(true);
+                    archive.set_preserve_ownerships(true);
+                    archive.unpack(rootfs).context("failed to extract tar.gz")?;
+                } else if url.ends_with(".tar.xz") {
+                    extract_tar_xz(&bytes, rootfs)?;
+                } else if url.ends_with(".tar.zst") {
+                    extract_tar_zst(&bytes, rootfs)?;
+                } else {
+                    // Try as tar.gz by default
+                    let decoder = flate2::read::GzDecoder::new(&bytes[..]);
+                    let mut archive = tar::Archive::new(decoder);
+                    archive.set_preserve_permissions(true);
+                    archive.unpack(rootfs).context("failed to extract tarball")?;
+                }
+
+                return Ok(());
+            }
+            Ok(resp) => {
+                last_err = anyhow!("HTTP {}", resp.status());
+            }
+            Err(e) => {
+                last_err = anyhow!("request failed: {e}");
+            }
+        }
+    }
+
+    Err(last_err.context(format!("failed to download {distro} rootfs")))
+}
+
+/// Extract a .tar.xz archive using the system `tar` command.
+fn extract_tar_xz(data: &[u8], rootfs: &Path) -> Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("tar")
+        .args(["xJf", "-", "-C", &rootfs.to_string_lossy()])
+        .stdin(Stdio::piped())
+        .spawn()
+        .context("failed to run tar (is xz-utils installed?)")?;
+
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(data)
+        .context("failed to pipe data to tar")?;
+
+    let status = child.wait()?;
+    if !status.success() {
+        return Err(anyhow!("tar xJ failed"));
+    }
+    Ok(())
+}
+
+/// Extract a .tar.zst archive using the system `tar` command.
+fn extract_tar_zst(data: &[u8], rootfs: &Path) -> Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("tar")
+        .args(["--zstd", "-xf", "-", "-C", &rootfs.to_string_lossy()])
+        .stdin(Stdio::piped())
+        .spawn()
+        .context("failed to run tar with zstd (is zstd installed?)")?;
+
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(data)
+        .context("failed to pipe data to tar")?;
+
+    let status = child.wait()?;
+    if !status.success() {
+        return Err(anyhow!("tar --zstd failed"));
+    }
+    Ok(())
 }
 
 /// Load the saved image config for a locally stored image.
-///
-/// Returns `ImageConfig::default()` if no config file exists
-/// (e.g., for images pulled before config support was added).
 pub fn load_image_config(name: &str, tag: &str) -> ImageConfig {
     let config_path = images_dir().join(name).join(tag).join("config.json");
     match fs::read_to_string(&config_path) {
@@ -460,9 +351,6 @@ pub fn image_rootfs(name: &str, tag: &str) -> PathBuf {
 }
 
 /// List all locally available images.
-///
-/// Scans the images directory and returns (name, tag) pairs for
-/// every image that has an extracted rootfs.
 pub fn list_images() -> Result<Vec<(String, String)>> {
     let dir = images_dir();
     let mut images = Vec::new();

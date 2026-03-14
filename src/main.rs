@@ -150,8 +150,9 @@ async fn cmd_run(args: corten::cli::RunArgs) -> Result<()> {
     Ok(())
 }
 
-/// Execute the `pull` subcommand — download an image from Docker Hub.
+/// Execute the `pull` subcommand — download an image from official distro mirrors.
 async fn cmd_pull(args: corten::cli::PullArgs) -> Result<()> {
+    require_privileges()?;
     let (name, tag) = parse_image_ref(&args.image);
     image::pull_image(name, tag).await?;
     Ok(())
