@@ -259,10 +259,10 @@ pub fn setup_container_network(container_id: &str, child_pid: i32) -> Result<Con
     })?;
 
     // 5. Rename peer to eth0 inside the container namespace
-    let ns_path = format!("/proc/{child_pid}/ns/net");
+    let net_ns = format!("--net=/proc/{child_pid}/ns/net");
     run_cmd(
         "nsenter",
-        &["--net", &ns_path, "ip", "link", "set", &veth_peer, "name", "eth0"],
+        &[&net_ns, "ip", "link", "set", &veth_peer, "name", "eth0"],
     )
     .with_context(|| format!("failed to rename {veth_peer} to eth0 in container"))?;
 
@@ -271,23 +271,14 @@ pub fn setup_container_network(container_id: &str, child_pid: i32) -> Result<Con
     let ip_cidr = format!("{ip}/24");
 
     // 7. Configure eth0 inside the container namespace
-    run_cmd(
-        "nsenter",
-        &["--net", &ns_path, "ip", "addr", "add", &ip_cidr, "dev", "eth0"],
-    )
-    .with_context(|| format!("failed to assign {ip_cidr} to eth0"))?;
+    run_cmd("nsenter", &[&net_ns, "ip", "addr", "add", &ip_cidr, "dev", "eth0"])
+        .with_context(|| format!("failed to assign {ip_cidr} to eth0"))?;
 
-    run_cmd(
-        "nsenter",
-        &["--net", &ns_path, "ip", "link", "set", "eth0", "up"],
-    )
-    .with_context(|| "failed to bring up eth0 in container".to_string())?;
+    run_cmd("nsenter", &[&net_ns, "ip", "link", "set", "eth0", "up"])
+        .with_context(|| "failed to bring up eth0 in container".to_string())?;
 
-    run_cmd(
-        "nsenter",
-        &["--net", &ns_path, "ip", "route", "add", "default", "via", BRIDGE_IP],
-    )
-    .with_context(|| format!("failed to add default route via {BRIDGE_IP}"))?;
+    run_cmd("nsenter", &[&net_ns, "ip", "route", "add", "default", "via", BRIDGE_IP])
+        .with_context(|| format!("failed to add default route via {BRIDGE_IP}"))?;
 
     log::info!(
         "container {short_id}: network configured (IP={ip}, bridge={BRIDGE_NAME}, veth={veth_host})"
