@@ -28,7 +28,7 @@ fn cli_version_exits_successfully() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("corten"));
-    assert!(stdout.contains("1.1.0"));
+    assert!(stdout.contains("0.1.0"));
 }
 
 #[test]
