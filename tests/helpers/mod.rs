@@ -46,3 +46,34 @@ pub fn wait_for_port(port: u16, timeout: std::time::Duration) -> bool {
     }
     false
 }
+
+/// Run the corten binary with given args and return (exit_code, stdout, stderr).
+pub fn run_corten(args: &[&str]) -> (i32, String, String) {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_corten"))
+        .args(args)
+        .output()
+        .expect("failed to execute corten binary");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
+}
+
+/// Run corten and assert it succeeds, returning stdout.
+pub fn run_corten_ok(args: &[&str]) -> String {
+    let (code, stdout, stderr) = run_corten(args);
+    assert!(
+        code == 0,
+        "corten {:?} failed (exit {code}):\nstdout: {stdout}\nstderr: {stderr}",
+        args
+    );
+    stdout
+}
+
+/// Generate a unique container name for tests.
+pub fn test_container_name(prefix: &str) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
+    format!("{prefix}-{ts}")
+}

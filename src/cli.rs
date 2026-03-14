@@ -54,6 +54,36 @@ pub enum Commands {
 
     /// Build an image from a Corten.toml file
     Build(BuildArgs),
+
+    /// Manage images
+    Image(ImageSubArgs),
+
+    /// System maintenance
+    System(SystemSubArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ImageSubArgs {
+    #[command(subcommand)]
+    pub command: ImageCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ImageCommands {
+    /// Remove unused images
+    Prune,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct SystemSubArgs {
+    #[command(subcommand)]
+    pub command: SystemCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SystemCommands {
+    /// Remove stopped containers and unused images
+    Prune,
 }
 
 /// Arguments for the `run` subcommand.
@@ -108,6 +138,10 @@ pub struct RunArgs {
     /// Run container in the background (detached mode)
     #[arg(short = 'd', long)]
     pub detach: bool,
+
+    /// Restart policy: no (default), always, on-failure[:max-retries]
+    #[arg(long, default_value = "no")]
+    pub restart: String,
 }
 
 /// Arguments for the `pull` subcommand.

@@ -161,6 +161,9 @@ fn child_main(args: &ChildArgs) -> Result<()> {
     // Security hardening: drop capabilities to safe default set (before exec)
     crate::security::drop_capabilities().ok();
 
+    // Security hardening: apply seccomp-BPF filter (after caps, before exec)
+    crate::security::apply_seccomp_filter().ok();
+
     // Build the argv for exec
     if args.command.is_empty() {
         return Err(anyhow!("no command specified"));

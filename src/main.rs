@@ -36,6 +36,8 @@ async fn main() -> Result<()> {
         Commands::Logs(args) => cmd_logs(args)?,
         Commands::Exec(args) => cmd_exec(args)?,
         Commands::Build(args) => cmd_build(args)?,
+        Commands::Image(args) => cmd_image(args)?,
+        Commands::System(args) => cmd_system(args)?,
     }
 
     Ok(())
@@ -134,6 +136,7 @@ async fn cmd_run(args: corten::cli::RunArgs) -> Result<()> {
         user: img_config.user,
         network_mode: args.network,
         ports,
+        restart_policy: args.restart,
     };
 
     let exit_code = container::run(&config, detach)?;
@@ -287,6 +290,7 @@ fn cmd_inspect(args: corten::cli::InspectArgs) -> Result<()> {
         println!("User:         {}", cfg.user);
     }
     println!("Network:      {}", cfg.network_mode);
+    println!("Restart:      {}", cfg.restart_policy);
     if !cfg.ports.is_empty() {
         println!();
         println!("Ports:");
@@ -490,5 +494,66 @@ fn cmd_network(args: corten::cli::NetworkArgs) -> Result<()> {
             println!("Removed network '{}'", rm_args.name);
         }
     }
+    Ok(())
+}
+
+/// Execute the `image` subcommand — manage images.
+fn cmd_image(args: corten::cli::ImageSubArgs) -> Result<()> {
+    match args.command {
+        corten::cli::ImageCommands::Prune => cmd_image_prune()?,
+    }
+    Ok(())
+}
+
+/// Remove all locally stored images.
+fn cmd_image_prune() -> Result<()> {
+    let images = image::list_images()?;
+    if images.is_empty() {
+        println!("No images to prune.");
+        return Ok(());
+    }
+
+    let mut removed = 0;
+    for (name, tag) in &images {
+        let rootfs = image::image_rootfs(name, tag);
+        // The tag directory contains rootfs/ and config.json — remove the whole tag dir
+        if let Some(parent) = rootfs.parent() {
+            std::fs::remove_dir_all(parent).ok();
+            removed += 1;
+            println!("Removed: {name}:{tag}");
+        }
+    }
+    println!("Removed {removed} image(s).");
+    Ok(())
+}
+
+/// Execute the `system` subcommand — system maintenance.
+fn cmd_system(args: corten::cli::SystemSubArgs) -> Result<()> {
+    match args.command {
+        corten::cli::SystemCommands::Prune => cmd_system_prune()?,
+    }
+    Ok(())
+}
+
+/// Remove stopped containers and unused images.
+fn cmd_system_prune() -> Result<()> {
+    let containers_dir = config::containers_dir();
+    let mut removed_containers = 0;
+    if containers_dir.exists() {
+        for entry in std::fs::read_dir(&containers_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if let Ok(state) = container::load_state(&path) {
+                if state.status == ContainerStatus::Stopped {
+                    std::fs::remove_dir_all(&path).ok();
+                    removed_containers += 1;
+                }
+            }
+        }
+    }
+    println!("Removed {removed_containers} stopped container(s).");
+
+    // Then prune images
+    cmd_image_prune()?;
     Ok(())
 }

@@ -218,3 +218,160 @@ pub fn mask_paths() -> Result<()> {
     log::info!("masked sensitive paths and made proc subsystems read-only");
     Ok(())
 }
+
+// --- Seccomp-BPF syscall filtering ---
+
+/// BPF filter instruction (matches `struct sock_filter` from <linux/filter.h>).
+#[repr(C)]
+struct SockFilter {
+    code: u16,
+    jt: u8,
+    jf: u8,
+    k: u32,
+}
+
+/// BPF filter program (matches `struct sock_fprog` from <linux/filter.h>).
+#[repr(C)]
+struct SockFprog {
+    len: u16,
+    filter: *const SockFilter,
+}
+
+// BPF instruction class/mode constants
+const BPF_LD: u16 = 0x00;
+const BPF_W: u16 = 0x00;
+const BPF_ABS: u16 = 0x20;
+const BPF_JMP: u16 = 0x05;
+const BPF_JEQ: u16 = 0x10;
+const BPF_K_JMP: u16 = 0x00;
+const BPF_RET: u16 = 0x06;
+const BPF_K_RET: u16 = 0x00;
+
+// Seccomp return action constants
+const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+
+/// x86_64 syscall numbers for dangerous calls that containers should never need.
+const BLOCKED_SYSCALLS: &[u32] = &[
+    246, // kexec_load
+    320, // kexec_file_load
+    169, // reboot
+    167, // swapon
+    168, // swapoff
+    175, // init_module
+    313, // finit_module
+    176, // delete_module
+    163, // acct
+    227, // clock_settime
+    305, // clock_adjtime
+    164, // settimeofday
+    159, // adjtimex
+    170, // sethostname
+    171, // setdomainname
+];
+
+/// Apply a seccomp-BPF filter to restrict dangerous syscalls.
+///
+/// Blocks syscalls that containers should never need:
+/// - `kexec_load`, `kexec_file_load`: load a new kernel
+/// - `reboot`: reboot the system
+/// - `swapon`, `swapoff`: manage swap space
+/// - `init_module`, `finit_module`, `delete_module`: kernel module operations
+/// - `acct`: process accounting
+/// - `clock_settime`, `clock_adjtime`, `settimeofday`, `adjtimex`: time manipulation
+/// - `sethostname`, `setdomainname`: hostname changes (already set during init)
+///
+/// Uses `SECCOMP_RET_ERRNO` (returns `EPERM`) rather than `SECCOMP_RET_KILL`
+/// for better debuggability.
+///
+/// Must be called after `drop_capabilities()` and before `exec()`.
+pub fn apply_seccomp_filter() -> Result<()> {
+    // Build the BPF filter program.
+    //
+    // Structure:
+    //   [0]   Load syscall number from seccomp_data.nr (offset 0)
+    //   [1..N] For each blocked syscall: JEQ <nr> -> jump to DENY, else fall through
+    //   [N+1] ALLOW (default action)
+    //   [N+2] DENY  (return EPERM)
+    let num_blocked = BLOCKED_SYSCALLS.len();
+    let mut filter: Vec<SockFilter> = Vec::with_capacity(num_blocked * 2 + 2);
+
+    // Instruction 0: load the syscall number (seccomp_data.nr is at offset 0)
+    filter.push(SockFilter {
+        code: BPF_LD | BPF_W | BPF_ABS,
+        jt: 0,
+        jf: 0,
+        k: 0, // offsetof(seccomp_data, nr)
+    });
+
+    // For each blocked syscall, add a JEQ instruction.
+    // If it matches, jump forward to the DENY instruction at the end.
+    // If it doesn't match, fall through to the next check (jf=0).
+    //
+    // After instruction 0 (the load), instructions [1..num_blocked] are the JEQ checks.
+    // Instruction [num_blocked + 1] is ALLOW.
+    // Instruction [num_blocked + 2] is DENY.
+    //
+    // From JEQ instruction at index `i` (1-based), the DENY instruction is at
+    // index (num_blocked + 2). The jump offset from instruction i is:
+    //   (num_blocked + 2) - (i + 1) = num_blocked + 1 - i
+    // But `i` ranges from 1 to num_blocked, so the jt offset is:
+    //   num_blocked + 1 - i  (for 1-indexed i)
+    // Or equivalently, for the k-th blocked syscall (0-indexed):
+    //   jt = (num_blocked - 1 - k) + 1 = num_blocked - k
+    // The jf is always 0 (fall through to next instruction).
+    for (k, &syscall_nr) in BLOCKED_SYSCALLS.iter().enumerate() {
+        let jump_to_deny = (num_blocked - k) as u8;
+        filter.push(SockFilter {
+            code: BPF_JMP | BPF_JEQ | BPF_K_JMP,
+            jt: jump_to_deny,
+            jf: 0,
+            k: syscall_nr,
+        });
+    }
+
+    // ALLOW: default action for non-blocked syscalls
+    filter.push(SockFilter {
+        code: BPF_RET | BPF_K_RET,
+        jt: 0,
+        jf: 0,
+        k: SECCOMP_RET_ALLOW,
+    });
+
+    // DENY: return EPERM (errno 1) for blocked syscalls
+    filter.push(SockFilter {
+        code: BPF_RET | BPF_K_RET,
+        jt: 0,
+        jf: 0,
+        k: SECCOMP_RET_ERRNO | 1, // EPERM = 1
+    });
+
+    // Set PR_SET_NO_NEW_PRIVS — required before installing a seccomp filter
+    // as a non-privileged process (and good practice regardless).
+    const PR_SET_NO_NEW_PRIVS: libc::c_int = 38;
+    if unsafe { libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        return Err(anyhow!(
+            "prctl(PR_SET_NO_NEW_PRIVS) failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    // Install the seccomp filter via the seccomp() syscall.
+    // SECCOMP_SET_MODE_FILTER = 1, flags = 0
+    let prog = SockFprog {
+        len: filter.len() as u16,
+        filter: filter.as_ptr(),
+    };
+    if unsafe { libc::syscall(libc::SYS_seccomp, 1u64, 0u64, &prog as *const _) } != 0 {
+        return Err(anyhow!(
+            "seccomp(SECCOMP_SET_MODE_FILTER) failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    log::info!(
+        "applied seccomp-BPF filter ({} syscalls blocked)",
+        BLOCKED_SYSCALLS.len()
+    );
+    Ok(())
+}

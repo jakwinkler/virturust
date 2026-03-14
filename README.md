@@ -1,96 +1,182 @@
-# VirtuRust
+# Corten
 
 A lightweight, high-performance container runtime written in Rust.
 
-VirtuRust provides Docker-like containerization with minimal overhead, using Linux kernel primitives directly — no daemons, no shims, just your binary and the kernel.
+Corten provides Docker-like containerization with minimal overhead, using Linux kernel primitives directly — no daemons, no shims, just your binary and the kernel. Named after corten (weathering) steel: less weight, more strength.
 
 ## Features
 
 - **Full namespace isolation** — PID, mount, UTS, IPC, and network namespaces
 - **cgroups v2 resource limits** — memory, CPU, and process count controls
-- **OCI image support** — pull images directly from Docker Hub
-- **Minimal footprint** — single static binary, no runtime dependencies
-- **Multi-architecture** — automatically selects the right image for your platform
+- **OCI image support** — pull images directly from Docker Hub with full config handling (ENV, CMD, ENTRYPOINT, WORKDIR, USER)
+- **OverlayFS** — copy-on-write container filesystems with per-container writable layers
+- **Volume mounts** — bind mount host directories into containers (`-v /host:/container[:ro]`)
+- **Full networking stack** — bridge (`corten0`), veth pairs, NAT, DNS, port forwarding (`-p`)
+- **Named networks** — create isolated networks with DNS-based container name resolution
+- **Detached mode** — run containers in the background (`-d`), view logs, exec into running containers
+- **Security hardening** — capability dropping, seccomp-BPF syscall filtering, masked sensitive paths
+- **Restart policies** — `--restart always`, `--restart on-failure:5`
+- **Declarative builds** — `Corten.toml` build file parser (image building coming soon)
+- **Minimal footprint** — single binary, no runtime dependencies, no daemon
 
-## Supported images
+## Quick start
 
-- Alpine Linux (`alpine`, `alpine:3.19`)
-- Ubuntu (`ubuntu:22.04`, `ubuntu:24.04`)
-- Debian (`debian:bookworm`, `debian:bullseye`)
-- Any Linux image on Docker Hub
+```bash
+# Install
+git clone https://github.com/jakwinkler/virturust.git
+cd virturust && make install
+
+# Run a container
+corten run alpine echo "hello from corten"
+
+# Run with resource limits and port forwarding
+corten run --memory 256m --cpus 0.5 -p 8080:80 nginx
+
+# Run in the background
+corten run -d --name myapp alpine sleep 3600
+
+# View logs and exec into it
+corten logs myapp
+corten exec myapp /bin/sh
+
+# Stop and clean up
+corten stop myapp
+corten rm myapp
+```
 
 ## Requirements
 
-- **Linux** kernel 4.18+ (for cgroups v2)
-- **Root privileges** (required for namespace creation)
+- **Linux** kernel 4.18+ (for cgroups v2 and OverlayFS)
+- **Root privileges** or Linux capabilities (`make install` sets these automatically)
 - **cgroups v2** mounted at `/sys/fs/cgroup` (default on modern distros)
 
-### Verify cgroups v2
-
 ```bash
-# Should show "cgroup2fs"
-stat -f -c %T /sys/fs/cgroup
+# Verify cgroups v2
+stat -f -c %T /sys/fs/cgroup   # Should show "cgroup2fs"
 ```
 
 ## Installation
 
-### From source (recommended)
-
 ```bash
 git clone https://github.com/jakwinkler/virturust.git
 cd virturust
-
-# Build and install with Linux capabilities (one-time sudo)
-make install
+make install    # builds, installs, and sets Linux capabilities
 ```
 
-After installation, **no sudo needed** — Linux capabilities grant only the
-specific privileges required for container operations.
-
-### Manual install
-
-```bash
-cargo build --release
-sudo cp target/release/virturust /usr/local/bin/
-```
+After installation, **no sudo needed** for container operations.
 
 ### Environment variables
 
-| Variable             | Default              | Description               |
-|----------------------|----------------------|---------------------------|
-| `VIRTURUST_DATA_DIR` | `/var/lib/virturust` | Image and container store |
+| Variable          | Default            | Description               |
+|-------------------|--------------------|---------------------------|
+| `CORTEN_DATA_DIR` | `/var/lib/corten`  | Image and container store |
 
 ## Usage
 
-### Pull an image
+### Images
 
 ```bash
-virturust pull alpine
-virturust pull ubuntu:22.04
-virturust pull debian:bookworm
+corten pull alpine                # Pull from Docker Hub
+corten pull ubuntu:22.04
+corten images                     # List local images
+corten image prune                # Remove all images
 ```
 
-### Run a container
+### Running containers
 
 ```bash
-# Basic — run an interactive shell
-virturust run alpine /bin/sh
+# Interactive shell
+corten run alpine /bin/sh
+
+# One-off command
+corten run alpine cat /etc/os-release
 
 # With resource limits
-virturust run --memory 256m --cpus 0.5 alpine /bin/sh
+corten run --memory 256m --cpus 0.5 --pids-limit 100 alpine /bin/sh
 
-# Full control
-virturust run \
-  --memory 1g \
-  --cpus 2 \
-  --pids-limit 100 \
-  --hostname mycontainer \
-  --name web-server \
-  ubuntu:22.04 /bin/bash
+# Named container with custom hostname
+corten run --name web --hostname webserver nginx
 
-# Run a one-off command
-virturust run alpine cat /etc/os-release
+# Volume mounts
+corten run -v /src:/app alpine ls /app
+corten run -v /data:/mnt:ro alpine cat /mnt/config.txt
+
+# Port forwarding
+corten run -p 8080:80 nginx
+corten run -p 127.0.0.1:3000:3000 myapp
+
+# Detached mode (background)
+corten run -d --name myapp alpine sleep 3600
+
+# Restart policies
+corten run --restart always --name daemon alpine my-service
+corten run --restart on-failure:5 --name worker alpine my-job
+
+# Network modes
+corten run --network bridge alpine ping 8.8.8.8    # default, full networking
+corten run --network none alpine /bin/sh            # no network
+corten run --network host alpine ip addr            # share host network
 ```
+
+### Container management
+
+```bash
+corten ps                         # List all containers
+corten inspect <name-or-id>       # Show detailed info
+corten logs <name> [-f] [-n 50]   # View container logs
+corten exec <name> /bin/sh        # Exec into running container
+corten stop <name>                # Stop (SIGTERM → SIGKILL)
+corten stop --time 30 <name>      # Custom grace period
+corten rm <name>                  # Remove stopped container
+corten system prune               # Remove stopped containers + images
+```
+
+### Named networks
+
+```bash
+# Create an isolated network
+corten network create backend
+
+# Run containers on it (they can resolve each other by name)
+corten run -d --name api --network backend alpine sleep 3600
+corten run -d --name db  --network backend alpine sleep 3600
+corten run --network backend alpine ping api    # resolves via /etc/hosts
+
+# Manage networks
+corten network ls
+corten network rm backend
+```
+
+### Build system (Corten.toml)
+
+Declarative image definition — simpler than Dockerfile:
+
+```toml
+[base]
+system = "ubuntu"
+version = "22.04"
+
+[packages]
+install = ["nginx", "php8.1-fpm", "php8.1-mysql"]
+
+[files]
+copy = [
+    { src = "nginx.conf", dest = "/etc/nginx/sites-available/default" },
+    { src = "src/", dest = "/var/www/html/", owner = "www-data" },
+]
+
+[container]
+command = ["nginx", "-g", "daemon off;"]
+user = "www-data"
+workdir = "/var/www/html"
+```
+
+```bash
+corten build .                    # Parse and validate (image building coming soon)
+corten build examples/nginx-php.toml
+```
+
+See `examples/` for more Corten.toml templates.
 
 ### Resource limits
 
@@ -100,98 +186,90 @@ virturust run alpine cat /etc/os-release
 | `--cpus`        | CPU limit (fractional cores)   | `--cpus 0.5`     |
 | `--pids-limit`  | Max number of processes        | `--pids-limit 50`|
 
-### Container management
-
-```bash
-# List all containers (running and stopped)
-virturust ps
-
-# Inspect a container's details
-virturust inspect <name-or-id>
-
-# Stop a running container (SIGTERM, then SIGKILL after timeout)
-virturust stop <name-or-id>
-virturust stop --time 30 <name-or-id>
-
-# Remove a stopped container
-virturust rm <name-or-id>
-
-# List locally cached images
-virturust images
-```
-
 ## Architecture
 
-VirtuRust is structured around Linux kernel isolation primitives:
-
 ```
-┌─────────────────────────────────────────────────┐
-│                   CLI (clap)                    │
-├─────────────────────────────────────────────────┤
-│               Container Manager                 │
-│         (lifecycle orchestration)               │
-├──────────┬──────────┬──────────┬────────────────┤
-│Namespaces│ cgroups  │Filesystem│   Networking   │
-│ (clone)  │  (v2)    │(pivot_rt)│   (netns)      │
-├──────────┴──────────┴──────────┴────────────────┤
-│              Image Manager                      │
-│     (OCI pull from Docker Hub)                  │
-├─────────────────────────────────────────────────┤
-│              Linux Kernel                       │
-└─────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│                    CLI (clap)                         │
+├──────────────────────────────────────────────────────┤
+│           Container Manager + Build System            │
+│          (lifecycle, restart, Corten.toml)            │
+├────────┬────────┬────────┬────────┬──────────────────┤
+│  NS    │cgroups │  FS    │  Net   │    Security      │
+│(clone) │ (v2)   │(pivot) │(bridge)│ (caps+seccomp)   │
+├────────┴────────┴────────┴────────┴──────────────────┤
+│                  Image Manager                        │
+│       OCI (Docker Hub) + Native (SquashFS)            │
+├──────────────────────────────────────────────────────┤
+│                   Linux Kernel                        │
+└──────────────────────────────────────────────────────┘
 ```
 
 ### Module overview
 
-| Module         | Purpose                                            |
-|----------------|----------------------------------------------------|
-| `cli`          | Command-line argument parsing (clap derive)        |
-| `config`       | Configuration types, resource limit parsing        |
-| `container`    | Container lifecycle (create → run → stop → cleanup)|
-| `namespace`    | Linux namespace creation via `clone()`             |
-| `cgroup`       | cgroups v2 resource limit enforcement              |
-| `filesystem`   | Mount setup, `pivot_root`, filesystem isolation    |
-| `image`        | OCI image pulling from Docker Hub                  |
-| `network`      | Network namespace setup (loopback, future: veth)   |
+| Module       | Purpose                                              |
+|--------------|------------------------------------------------------|
+| `cli`        | Command-line argument parsing (clap derive)          |
+| `config`     | Configuration types, volume/port/memory parsing      |
+| `container`  | Container lifecycle (run, stop, restart, state)      |
+| `namespace`  | Linux namespace creation via `clone()`               |
+| `cgroup`     | cgroups v2 resource limit enforcement                |
+| `filesystem` | OverlayFS, mount setup, `pivot_root`, minimal `/dev` |
+| `image`      | OCI image pulling with config + whiteout handling    |
+| `network`    | Bridge, veth, NAT, port forwarding, named networks   |
+| `security`   | Capability dropping, seccomp-BPF, path masking       |
+| `build`      | Corten.toml parser and build planning                |
 
-### How `virturust run` works
+### How `corten run` works
 
-1. **Parse CLI** — validate arguments and resource limits
-2. **Pull image** — download from Docker Hub if not cached locally
-3. **Create cgroup** — set up resource limits in `/sys/fs/cgroup/virturust/<id>/`
-4. **Clone process** — `clone()` with `CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNET`
-5. **Add to cgroup** — move the child PID into the cgroup
-6. **Signal child** — tell the child that cgroup setup is complete (via pipe)
-7. **Child: setup** — set hostname, mount `/proc`, `/sys`, `/dev`, `pivot_root`
-8. **Child: exec** — replace the init process with the requested command
-9. **Parent: wait** — block until the container exits
-10. **Cleanup** — remove cgroup and container state
-
-## Roadmap
-
-- [ ] OverlayFS for copy-on-write container filesystems
-- [ ] veth networking with bridge and NAT
-- [ ] Port forwarding (`--publish` / `-p`)
-- [ ] User namespace mapping (rootless containers)
-- [ ] Container-to-container networking
-- [ ] Build command (Dockerfile-like)
-- [ ] Volume mounts (`--volume` / `-v`)
-- [ ] Seccomp-BPF syscall filtering
-- [ ] Container logs
-- [ ] Compose-like multi-container orchestration
+1. **Parse CLI** — validate arguments, resource limits, volumes, ports
+2. **Pull image** — download from Docker Hub if not cached (with OCI config)
+3. **OverlayFS** — set up copy-on-write layer over the image rootfs
+4. **DNS** — copy host resolv.conf into container rootfs
+5. **Bridge + NAT** — create `corten0` bridge, enable IP forwarding
+6. **Create cgroup** — set up resource limits
+7. **Clone process** — `clone()` with PID/mount/UTS/IPC/network namespaces
+8. **Networking** — create veth pair, assign IP, set up routing
+9. **Port forwarding** — add iptables DNAT rules
+10. **Signal child** — tell child that setup is complete
+11. **Child: init** — hostname, mount proc/sys/dev, volumes, `pivot_root`
+12. **Child: security** — mask paths, drop capabilities, apply seccomp
+13. **Child: exec** — set env/workdir/user, exec the command
+14. **Parent: wait** — block until exit (or return in detach mode)
+15. **Cleanup** — remove cgroup, network, overlay
 
 ## How it compares to Docker
 
-| Feature              | Docker          | VirtuRust (v0.1)     |
-|----------------------|-----------------|----------------------|
-| Container runtime    | runc + containerd| Built-in (single binary)|
-| Image format         | OCI             | OCI                  |
-| Resource limits      | cgroups v1/v2   | cgroups v2           |
-| Networking           | Full stack      | Loopback only (WIP)  |
-| Rootless mode        | Yes             | Planned              |
-| Build system         | Dockerfile      | Planned              |
-| Compose              | docker-compose  | Planned              |
-| Platform             | Linux/Mac/Win   | Linux only           |
+| Feature              | Docker              | Corten                   |
+|----------------------|---------------------|--------------------------|
+| Architecture         | Client → daemon → containerd → runc | Single binary, no daemon |
+| Container runtime    | runc + containerd   | Built-in                 |
+| Image format         | OCI                 | OCI + SquashFS (planned) |
+| Resource limits      | cgroups v1/v2       | cgroups v2               |
+| Filesystem           | OverlayFS           | OverlayFS                |
+| Networking           | Full stack           | Bridge, NAT, veth, DNS   |
+| Port forwarding      | Yes                 | Yes                      |
+| Volume mounts        | Yes                 | Yes                      |
+| Detached mode        | Yes                 | Yes                      |
+| Logs                 | Yes                 | Yes                      |
+| Exec                 | Yes                 | Yes                      |
+| Security             | seccomp + caps      | seccomp + caps           |
+| Build system         | Dockerfile          | Corten.toml (in progress)|
+| Rootless mode        | Yes                 | Planned                  |
+| Compose              | docker-compose      | Planned                  |
+| Platform             | Linux/Mac/Win       | Linux                    |
+| Language             | Go                  | Rust                     |
+
+## Testing
+
+```bash
+make test                # Unit tests (no root needed)
+make test-integration    # Integration tests (needs root + cgroups v2)
+make test-e2e            # E2E tests (needs root + cgroups v2 + network)
+make test-all            # Everything
+make clippy              # Lint
+make check               # Lint + unit tests
+```
 
 ## License
 

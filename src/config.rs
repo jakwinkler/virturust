@@ -96,10 +96,18 @@ pub struct ContainerConfig {
     /// Port mappings (host port → container port)
     #[serde(default)]
     pub ports: Vec<PortMapping>,
+
+    /// Restart policy: "no", "always", "on-failure:N"
+    #[serde(default = "default_restart_policy")]
+    pub restart_policy: String,
 }
 
 fn default_network_mode() -> String {
     "bridge".to_string()
+}
+
+fn default_restart_policy() -> String {
+    "no".to_string()
 }
 
 /// Runtime state of a container instance.

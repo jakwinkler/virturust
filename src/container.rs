@@ -24,6 +24,33 @@ use crate::config::{
 };
 use crate::namespace::{create_namespaced_process, ChildArgs};
 
+/// Parsed restart policy.
+enum RestartPolicy {
+    /// Never restart (default).
+    No,
+    /// Always restart regardless of exit code.
+    Always,
+    /// Restart only on non-zero exit. 0 means unlimited retries.
+    OnFailure(u32),
+}
+
+/// Parse a restart policy string into a `RestartPolicy`.
+fn parse_restart_policy(s: &str) -> RestartPolicy {
+    if s == "always" {
+        RestartPolicy::Always
+    } else if s == "no" || s.is_empty() {
+        RestartPolicy::No
+    } else if let Some(rest) = s.strip_prefix("on-failure") {
+        let max = rest
+            .strip_prefix(':')
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0);
+        RestartPolicy::OnFailure(max)
+    } else {
+        RestartPolicy::No
+    }
+}
+
 /// Save container state to disk.
 fn save_state(container_dir: &Path, state: &ContainerState) -> Result<()> {
     let json = serde_json::to_string_pretty(state)?;
@@ -175,146 +202,172 @@ pub fn run(config: &ContainerConfig, detach: bool) -> Result<i32> {
         cgroup.set_pids_limit(pids)?;
     }
 
-    // Create sync pipe for parent-child coordination
-    let mut fds = [0i32; 2];
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-        return Err(anyhow!(
-            "pipe() failed: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-    let (pipe_rd, pipe_wr) = (fds[0], fds[1]);
-
-    // Create the container process in new namespaces
-    let child_args = ChildArgs {
-        rootfs: container_rootfs.to_string_lossy().to_string(),
-        hostname: config.hostname.clone(),
-        command: config.command.clone(),
-        sync_pipe_rd: pipe_rd,
-        volumes: config.volumes.clone(),
-        env: config.env.clone(),
-        working_dir: config.working_dir.clone(),
-        user: config.user.clone(),
-        network_mode: config.network_mode.clone(),
-        stdout_log: container_dir.join("stdout.log").to_string_lossy().to_string(),
-        stderr_log: container_dir.join("stderr.log").to_string_lossy().to_string(),
-    };
-
-    let child_pid = create_namespaced_process(child_args)?;
-
-    // Close read end in parent
-    unsafe { libc::close(pipe_rd) };
-
-    // Add child to cgroup before it starts doing work
-    cgroup.add_process(child_pid)?;
-
-    // Set up container networking (veth pair, IP allocation, routing)
-    let mut container_ip = String::new();
+    let restart_policy = parse_restart_policy(&config.restart_policy);
     let is_named_network = !matches!(config.network_mode.as_str(), "bridge" | "none" | "host");
+    let mut restart_count = 0u32;
+    let final_exit_code;
 
-    if config.network_mode == "bridge" {
-        let container_net = crate::network::setup_container_network(&config.id, child_pid)
-            .context("failed to set up container network")?;
-        container_ip = container_net.ip.clone();
-        log::info!(
-            "container network: IP={}, bridge={}, veth={}",
-            container_net.ip,
-            container_net.bridge,
-            container_net.veth_host
-        );
-
-        // Set up port forwarding
-        if !config.ports.is_empty() {
-            crate::network::setup_port_forwarding(&container_net.ip, &config.ports)
-                .context("failed to set up port forwarding")?;
+    loop {
+        // Create sync pipe for parent-child coordination
+        let mut fds = [0i32; 2];
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return Err(anyhow!(
+                "pipe() failed: {}",
+                std::io::Error::last_os_error()
+            ));
         }
-    } else if is_named_network {
-        let container_net = crate::network::setup_container_named_network(
-            &config.network_mode,
-            &config.id,
-            child_pid,
-        )
-        .with_context(|| format!("failed to set up named network '{}'", config.network_mode))?;
-        container_ip = container_net.ip.clone();
+        let (pipe_rd, pipe_wr) = (fds[0], fds[1]);
 
-        // Register container for DNS resolution
-        crate::network::register_container_in_network(
-            &config.network_mode,
-            &config.name,
-            &container_net.ip,
-        )
-        .ok();
+        // Create the container process in new namespaces
+        let child_args = ChildArgs {
+            rootfs: container_rootfs.to_string_lossy().to_string(),
+            hostname: config.hostname.clone(),
+            command: config.command.clone(),
+            sync_pipe_rd: pipe_rd,
+            volumes: config.volumes.clone(),
+            env: config.env.clone(),
+            working_dir: config.working_dir.clone(),
+            user: config.user.clone(),
+            network_mode: config.network_mode.clone(),
+            stdout_log: container_dir.join("stdout.log").to_string_lossy().to_string(),
+            stderr_log: container_dir.join("stderr.log").to_string_lossy().to_string(),
+        };
 
-        // Write /etc/hosts for DNS name resolution
-        crate::network::setup_named_network_dns(
-            &container_rootfs,
-            &config.network_mode,
-            &config.name,
-            &container_net.ip,
-        )
-        .ok();
+        let child_pid = create_namespaced_process(child_args)?;
 
-        log::info!(
-            "container network: IP={}, network={}, bridge={}",
-            container_net.ip,
-            config.network_mode,
-            container_net.bridge
-        );
+        // Close read end in parent
+        unsafe { libc::close(pipe_rd) };
 
-        if !config.ports.is_empty() {
-            crate::network::setup_port_forwarding(&container_net.ip, &config.ports)
-                .context("failed to set up port forwarding")?;
+        // Add child to cgroup before it starts doing work
+        cgroup.add_process(child_pid)?;
+
+        // Set up container networking (veth pair, IP allocation, routing)
+        let mut container_ip = String::new();
+
+        if config.network_mode == "bridge" {
+            let container_net = crate::network::setup_container_network(&config.id, child_pid)
+                .context("failed to set up container network")?;
+            container_ip = container_net.ip.clone();
+            log::info!(
+                "container network: IP={}, bridge={}, veth={}",
+                container_net.ip,
+                container_net.bridge,
+                container_net.veth_host
+            );
+
+            // Set up port forwarding
+            if !config.ports.is_empty() {
+                crate::network::setup_port_forwarding(&container_net.ip, &config.ports)
+                    .context("failed to set up port forwarding")?;
+            }
+        } else if is_named_network {
+            let container_net = crate::network::setup_container_named_network(
+                &config.network_mode,
+                &config.id,
+                child_pid,
+            )
+            .with_context(|| format!("failed to set up named network '{}'", config.network_mode))?;
+            container_ip = container_net.ip.clone();
+
+            // Register container for DNS resolution
+            crate::network::register_container_in_network(
+                &config.network_mode,
+                &config.name,
+                &container_net.ip,
+            )
+            .ok();
+
+            // Write /etc/hosts for DNS name resolution
+            crate::network::setup_named_network_dns(
+                &container_rootfs,
+                &config.network_mode,
+                &config.name,
+                &container_net.ip,
+            )
+            .ok();
+
+            log::info!(
+                "container network: IP={}, network={}, bridge={}",
+                container_net.ip,
+                config.network_mode,
+                container_net.bridge
+            );
+
+            if !config.ports.is_empty() {
+                crate::network::setup_port_forwarding(&container_net.ip, &config.ports)
+                    .context("failed to set up port forwarding")?;
+            }
         }
+
+        // Signal child that cgroup and network are ready
+        unsafe {
+            libc::write(pipe_wr, [0u8].as_ptr() as *const libc::c_void, 1);
+            libc::close(pipe_wr);
+        }
+
+        // Update state: running
+        state.status = ContainerStatus::Running;
+        state.pid = Some(child_pid);
+        state.started_at = Some(unix_timestamp());
+        save_state(&container_dir, &state)?;
+
+        if restart_count == 0 {
+            println!("Container '{}' started (PID {})", config.name, child_pid);
+        }
+
+        // In detach mode, return immediately without waiting for the child
+        if detach {
+            println!("{}", config.id);
+            return Ok(0);
+        }
+
+        // Wait for the container process to exit
+        let mut wait_status: libc::c_int = 0;
+        let ret = unsafe { libc::waitpid(child_pid, &mut wait_status, 0) };
+        if ret == -1 {
+            log::error!("waitpid failed: {}", std::io::Error::last_os_error());
+        }
+
+        let exit_code = if libc::WIFEXITED(wait_status) {
+            libc::WEXITSTATUS(wait_status)
+        } else if libc::WIFSIGNALED(wait_status) {
+            128 + libc::WTERMSIG(wait_status)
+        } else {
+            1
+        };
+
+        // Cleanup networking for this iteration
+        if !config.ports.is_empty() && !container_ip.is_empty() {
+            crate::network::cleanup_port_forwarding(&container_ip, &config.ports).ok();
+        }
+        if config.network_mode == "bridge" || is_named_network {
+            crate::network::cleanup_container_network(&config.id).ok();
+        }
+
+        // Check restart policy
+        let should_restart = match &restart_policy {
+            RestartPolicy::No => false,
+            RestartPolicy::Always => true,
+            RestartPolicy::OnFailure(max) => exit_code != 0 && (*max == 0 || restart_count < *max),
+        };
+
+        if !should_restart {
+            final_exit_code = exit_code;
+            break;
+        }
+
+        restart_count += 1;
+        println!("Container '{}' restarting (attempt {restart_count})...", config.name);
+        std::thread::sleep(std::time::Duration::from_secs(1)); // Brief pause before restart
     }
-
-    // Signal child that cgroup and network are ready
-    unsafe {
-        libc::write(pipe_wr, [0u8].as_ptr() as *const libc::c_void, 1);
-        libc::close(pipe_wr);
-    }
-
-    // Update state: running
-    state.status = ContainerStatus::Running;
-    state.pid = Some(child_pid);
-    state.started_at = Some(unix_timestamp());
-    save_state(&container_dir, &state)?;
-
-    println!("Container '{}' started (PID {})", config.name, child_pid);
-
-    // In detach mode, return immediately without waiting for the child
-    if detach {
-        println!("{}", config.id);
-        return Ok(0);
-    }
-
-    // Wait for the container process to exit
-    let mut wait_status: libc::c_int = 0;
-    let ret = unsafe { libc::waitpid(child_pid, &mut wait_status, 0) };
-    if ret == -1 {
-        log::error!("waitpid failed: {}", std::io::Error::last_os_error());
-    }
-
-    let exit_code = if libc::WIFEXITED(wait_status) {
-        libc::WEXITSTATUS(wait_status)
-    } else if libc::WIFSIGNALED(wait_status) {
-        128 + libc::WTERMSIG(wait_status)
-    } else {
-        1
-    };
 
     // Update state: stopped
     state.status = ContainerStatus::Stopped;
     state.finished_at = Some(unix_timestamp());
-    state.exit_code = Some(exit_code);
+    state.exit_code = Some(final_exit_code);
     save_state(&container_dir, &state)?;
 
-    // Cleanup port forwarding and container network
-    if !config.ports.is_empty() && !container_ip.is_empty() {
-        crate::network::cleanup_port_forwarding(&container_ip, &config.ports).ok();
-    }
-    if config.network_mode == "bridge" || is_named_network {
-        crate::network::cleanup_container_network(&config.id).ok();
-    }
+    // Cleanup named network registration
     if is_named_network {
         crate::network::unregister_container_from_network(
             &config.network_mode,
@@ -330,10 +383,10 @@ pub fn run(config: &ContainerConfig, detach: bool) -> Result<i32> {
     cgroup.destroy().ok();
 
     log::info!(
-        "container '{}' exited with code {exit_code}",
+        "container '{}' exited with code {final_exit_code}",
         config.name
     );
-    Ok(exit_code)
+    Ok(final_exit_code)
 }
 
 /// Stop a running container by sending signals to its process.
