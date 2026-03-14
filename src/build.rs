@@ -1,10 +1,10 @@
-//! Corten.toml build file parser.
+//! Corten.toml build file parser and image builder.
 //!
-//! Defines the schema for declarative image building.
-//! The actual build pipeline (bootstrapping, package installation,
-//! SquashFS packing) will be implemented in a future phase.
+//! Builds container images from scratch using Corten.toml definitions.
+//! Downloads base OS rootfs from official distro mirrors (no Docker Hub),
+//! installs packages, copies files, and stores the result as a local image.
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -186,8 +186,407 @@ pub fn print_build_plan(config: &BuildConfig) {
             println!("  Workdir:   {workdir}");
         }
     }
+}
+
+// =============================================================================
+// Image building pipeline
+// =============================================================================
+
+/// Build an image from a Corten.toml configuration.
+///
+/// The pipeline:
+/// 1. Download or bootstrap the base OS rootfs
+/// 2. Install packages via chroot
+/// 3. Copy files
+/// 4. Run setup commands
+/// 5. Write image config
+/// 6. Store in /var/lib/corten/images/<name>/<tag>/
+pub async fn build_image(config: &BuildConfig, toml_dir: &Path) -> Result<std::path::PathBuf> {
+    let image_name = config
+        .image
+        .as_ref()
+        .map(|i| i.name.as_str())
+        .unwrap_or(&config.base.system);
+    let image_tag = config
+        .image
+        .as_ref()
+        .map(|i| i.tag.as_str())
+        .unwrap_or(&config.base.version);
+
+    println!("Building {image_name}:{image_tag}...");
+
+    // Determine where to store the image
+    let image_dir = crate::config::images_dir().join(image_name).join(image_tag);
+    let rootfs = image_dir.join("rootfs");
+
+    if rootfs.exists() {
+        std::fs::remove_dir_all(&rootfs).context("failed to clean existing rootfs")?;
+    }
+    std::fs::create_dir_all(&rootfs).context("failed to create rootfs directory")?;
+
+    // Step 1: Bootstrap base OS
+    println!("  [1/6] Bootstrapping {} {}...", config.base.system, config.base.version);
+    bootstrap_rootfs(&config.base.system, &config.base.version, &rootfs).await?;
+
+    // Step 2: Install packages
+    if let Some(packages) = &config.packages {
+        if !packages.install.is_empty() {
+            println!(
+                "  [2/6] Installing {} packages...",
+                packages.install.len()
+            );
+            install_packages(&config.base.system, &rootfs, &packages.install)?;
+        }
+    } else {
+        println!("  [2/6] No packages to install.");
+    }
+
+    // Step 3: Copy files
+    if let Some(files) = &config.files {
+        println!("  [3/6] Copying {} files...", files.copy.len());
+        copy_files(toml_dir, &rootfs, &files.copy)?;
+    } else {
+        println!("  [3/6] No files to copy.");
+    }
+
+    // Step 4: Run setup commands
+    if let Some(setup) = &config.setup {
+        println!("  [4/6] Running {} setup commands...", setup.run.len());
+        run_setup_commands(&rootfs, &setup.run)?;
+    } else {
+        println!("  [4/6] No setup commands.");
+    }
+
+    // Step 5: Clean package cache
+    println!("  [5/6] Cleaning package cache...");
+    clean_package_cache(&config.base.system, &rootfs);
+
+    // Step 6: Write image config
+    println!("  [6/6] Writing image config...");
+    let img_config = crate::image::ImageConfig {
+        env: config
+            .env
+            .as_ref()
+            .map(|e| e.iter().map(|(k, v)| format!("{k}={v}")).collect())
+            .unwrap_or_default(),
+        cmd: config
+            .container
+            .as_ref()
+            .and_then(|c| c.command.clone())
+            .unwrap_or_default(),
+        entrypoint: Vec::new(),
+        working_dir: config
+            .container
+            .as_ref()
+            .and_then(|c| c.workdir.clone())
+            .unwrap_or_default(),
+        user: config
+            .container
+            .as_ref()
+            .and_then(|c| c.user.clone())
+            .unwrap_or_default(),
+    };
+    let config_json = serde_json::to_string_pretty(&img_config)?;
+    std::fs::write(image_dir.join("config.json"), config_json)
+        .context("failed to write image config")?;
 
     println!();
-    println!("  NOTE: Actual image building is not yet implemented.");
-    println!("        This is a preview of what `corten build` will do.");
+    println!("Successfully built {image_name}:{image_tag}");
+    println!("  Rootfs: {}", rootfs.display());
+
+    Ok(rootfs)
+}
+
+/// Bootstrap a base OS rootfs.
+async fn bootstrap_rootfs(system: &str, version: &str, rootfs: &Path) -> Result<()> {
+    match system.to_lowercase().as_str() {
+        "alpine" => bootstrap_alpine(version, rootfs).await,
+        "ubuntu" | "debian" => bootstrap_debootstrap(system, version, rootfs),
+        "fedora" | "rhel" | "centos" => bootstrap_dnf(version, rootfs),
+        _ => Err(anyhow!("unsupported base system: '{system}'")),
+    }
+}
+
+/// Bootstrap Alpine by downloading the minirootfs tarball.
+async fn bootstrap_alpine(version: &str, rootfs: &Path) -> Result<()> {
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "x86_64",
+        "aarch64" => "aarch64",
+        _ => "x86_64",
+    };
+
+    // Try multiple URL patterns (Alpine versioning varies)
+    let urls = vec![
+        format!("https://dl-cdn.alpinelinux.org/alpine/v{version}/releases/{arch}/alpine-minirootfs-{version}.0-{arch}.tar.gz"),
+        format!("https://dl-cdn.alpinelinux.org/alpine/v{version}/releases/{arch}/alpine-minirootfs-{version}.1-{arch}.tar.gz"),
+        format!("https://dl-cdn.alpinelinux.org/alpine/v{version}/releases/{arch}/alpine-minirootfs-{version}.2-{arch}.tar.gz"),
+        format!("https://dl-cdn.alpinelinux.org/alpine/v{version}/releases/{arch}/alpine-minirootfs-{version}.3-{arch}.tar.gz"),
+    ];
+
+    let client = reqwest::Client::new();
+    let mut last_err = anyhow!("no URLs to try");
+
+    for url in &urls {
+        println!("    Trying {url}");
+        match client.get(url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                let bytes = resp.bytes().await.context("failed to download rootfs")?;
+                println!("    Downloaded {:.1} MB", bytes.len() as f64 / 1_048_576.0);
+
+                // Extract tar.gz
+                let decoder = flate2::read::GzDecoder::new(&bytes[..]);
+                let mut archive = tar::Archive::new(decoder);
+                archive.set_preserve_permissions(true);
+                archive.set_preserve_ownerships(true);
+                archive.unpack(rootfs).context("failed to extract rootfs")?;
+
+                // Set up resolv.conf for package installation
+                let etc = rootfs.join("etc");
+                std::fs::create_dir_all(&etc).ok();
+                if Path::new("/etc/resolv.conf").exists() {
+                    std::fs::copy("/etc/resolv.conf", etc.join("resolv.conf")).ok();
+                }
+
+                return Ok(());
+            }
+            Ok(resp) => {
+                last_err = anyhow!("HTTP {}: {url}", resp.status());
+            }
+            Err(e) => {
+                last_err = anyhow!("download failed: {e}");
+            }
+        }
+    }
+
+    Err(last_err.context(format!(
+        "failed to download Alpine {version} minirootfs. Check version number."
+    )))
+}
+
+/// Bootstrap Ubuntu/Debian using debootstrap.
+fn bootstrap_debootstrap(system: &str, version: &str, rootfs: &Path) -> Result<()> {
+    // Map version to codename for debootstrap
+    let suite = match (system, version) {
+        ("ubuntu", "24.04") => "noble",
+        ("ubuntu", "22.04") => "jammy",
+        ("ubuntu", "20.04") => "focal",
+        ("debian", "12") | ("debian", "bookworm") => "bookworm",
+        ("debian", "11") | ("debian", "bullseye") => "bullseye",
+        _ => version, // try using version as suite name directly
+    };
+
+    let mirror = match system {
+        "ubuntu" => "http://archive.ubuntu.com/ubuntu",
+        _ => "http://deb.debian.org/debian",
+    };
+
+    println!("    Running debootstrap --variant=minbase {suite} ...");
+
+    let status = std::process::Command::new("debootstrap")
+        .args([
+            "--variant=minbase",
+            suite,
+            &rootfs.to_string_lossy(),
+            mirror,
+        ])
+        .status()
+        .context("failed to run debootstrap. Install with: sudo apt install debootstrap")?;
+
+    if !status.success() {
+        return Err(anyhow!("debootstrap failed with exit code {}", status));
+    }
+
+    Ok(())
+}
+
+/// Bootstrap Fedora/RHEL using dnf.
+fn bootstrap_dnf(version: &str, rootfs: &Path) -> Result<()> {
+    let status = std::process::Command::new("dnf")
+        .args([
+            "--installroot",
+            &rootfs.to_string_lossy(),
+            "--releasever",
+            version,
+            "install",
+            "-y",
+            "bash",
+            "coreutils",
+        ])
+        .status()
+        .context("failed to run dnf. Install with: sudo dnf install dnf")?;
+
+    if !status.success() {
+        return Err(anyhow!("dnf bootstrap failed"));
+    }
+
+    Ok(())
+}
+
+/// Install packages into the rootfs using the appropriate package manager.
+fn install_packages(system: &str, rootfs: &Path, packages: &[String]) -> Result<()> {
+    let rootfs_str = rootfs.to_string_lossy();
+
+    match detect_package_manager(system) {
+        "apk" => {
+            // Alpine: apk add --root <rootfs>
+            let mut cmd = std::process::Command::new("chroot");
+            cmd.arg(&*rootfs_str);
+            cmd.args(["apk", "add", "--no-cache"]);
+            cmd.args(packages);
+            let status = cmd.status().context("failed to run apk in chroot")?;
+            if !status.success() {
+                return Err(anyhow!("apk add failed"));
+            }
+        }
+        "apt" => {
+            // Ubuntu/Debian: chroot + apt-get
+            let status = std::process::Command::new("chroot")
+                .arg(&*rootfs_str)
+                .args(["apt-get", "update", "-qq"])
+                .env("DEBIAN_FRONTEND", "noninteractive")
+                .status()
+                .context("failed to run apt-get update")?;
+            if !status.success() {
+                log::warn!("apt-get update failed (may still work)");
+            }
+
+            let mut cmd = std::process::Command::new("chroot");
+            cmd.arg(&*rootfs_str);
+            cmd.args(["apt-get", "install", "-y", "-qq"]);
+            cmd.env("DEBIAN_FRONTEND", "noninteractive");
+            cmd.args(packages);
+            let status = cmd.status().context("failed to run apt-get install")?;
+            if !status.success() {
+                return Err(anyhow!("apt-get install failed"));
+            }
+        }
+        "dnf" => {
+            let mut cmd = std::process::Command::new("chroot");
+            cmd.arg(&*rootfs_str);
+            cmd.args(["dnf", "install", "-y"]);
+            cmd.args(packages);
+            let status = cmd.status().context("failed to run dnf install")?;
+            if !status.success() {
+                return Err(anyhow!("dnf install failed"));
+            }
+        }
+        other => {
+            return Err(anyhow!(
+                "package installation not supported for package manager: {other}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Copy files from the build context into the rootfs.
+fn copy_files(toml_dir: &Path, rootfs: &Path, files: &[FileCopy]) -> Result<()> {
+    for f in files {
+        let src = toml_dir.join(&f.src);
+        let dest = rootfs.join(f.dest.trim_start_matches('/'));
+
+        if !src.exists() {
+            log::warn!("source file not found: {} (skipping)", src.display());
+            continue;
+        }
+
+        // Create parent directory
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        if src.is_dir() {
+            // Recursive copy
+            copy_dir_all(&src, &dest)?;
+        } else {
+            std::fs::copy(&src, &dest)
+                .with_context(|| format!("failed to copy {} -> {}", src.display(), dest.display()))?;
+        }
+
+        // Set owner if specified (best-effort)
+        if let Some(owner) = &f.owner {
+            std::process::Command::new("chroot")
+                .arg(&rootfs.to_string_lossy().to_string())
+                .args(["chown", "-R", owner, &f.dest])
+                .status()
+                .ok();
+        }
+
+        println!("    {} -> {}", f.src, f.dest);
+    }
+
+    Ok(())
+}
+
+/// Recursively copy a directory.
+fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let dst_path = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_all(&entry.path(), &dst_path)?;
+        } else {
+            std::fs::copy(entry.path(), &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Run setup commands in chroot.
+fn run_setup_commands(rootfs: &Path, commands: &[String]) -> Result<()> {
+    let rootfs_str = rootfs.to_string_lossy();
+
+    for cmd_str in commands {
+        println!("    $ {cmd_str}");
+        let status = std::process::Command::new("chroot")
+            .arg(&*rootfs_str)
+            .args(["sh", "-c", cmd_str])
+            .status()
+            .with_context(|| format!("failed to run: {cmd_str}"))?;
+
+        if !status.success() {
+            return Err(anyhow!("setup command failed: {cmd_str}"));
+        }
+    }
+
+    Ok(())
+}
+
+/// Clean package manager caches to reduce image size.
+fn clean_package_cache(system: &str, rootfs: &Path) {
+    let rootfs_str = rootfs.to_string_lossy();
+
+    match detect_package_manager(system) {
+        "apk" => {
+            std::process::Command::new("chroot")
+                .arg(&*rootfs_str)
+                .args(["rm", "-rf", "/var/cache/apk/*"])
+                .status()
+                .ok();
+        }
+        "apt" => {
+            std::process::Command::new("chroot")
+                .arg(&*rootfs_str)
+                .args(["apt-get", "clean"])
+                .status()
+                .ok();
+            // Remove apt lists
+            let lists = rootfs.join("var/lib/apt/lists");
+            if lists.exists() {
+                std::fs::remove_dir_all(&lists).ok();
+                std::fs::create_dir_all(&lists).ok();
+            }
+        }
+        "dnf" => {
+            std::process::Command::new("chroot")
+                .arg(&*rootfs_str)
+                .args(["dnf", "clean", "all"])
+                .status()
+                .ok();
+        }
+        _ => {}
+    }
 }

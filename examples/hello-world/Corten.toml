@@ -1,0 +1,17 @@
+# Minimal example: Alpine with curl
+# Build: sudo corten build examples/hello-world
+# Run:   corten run hello-world curl --version
+
+[image]
+name = "hello-world"
+tag = "latest"
+
+[base]
+system = "alpine"
+version = "3.20"
+
+[packages]
+install = ["curl"]
+
+[container]
+command = ["echo", "Hello from Corten!"]

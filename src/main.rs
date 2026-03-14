@@ -443,7 +443,7 @@ fn cmd_exec(args: corten::cli::ExecArgs) -> Result<()> {
     std::process::exit(status.code().unwrap_or(1));
 }
 
-/// Execute the `build` subcommand — parse and validate a Corten.toml.
+/// Execute the `build` subcommand — build an image from Corten.toml.
 fn cmd_build(args: corten::cli::BuildArgs) -> Result<()> {
     use corten::build;
 
@@ -460,7 +460,18 @@ fn cmd_build(args: corten::cli::BuildArgs) -> Result<()> {
 
     let config = build::parse_build_config(&toml_path)?;
     build::validate_build_config(&config)?;
-    build::print_build_plan(&config);
+
+    if args.dry_run {
+        build::print_build_plan(&config);
+        return Ok(());
+    }
+
+    require_privileges()?;
+
+    // Build the image (async for downloading base OS)
+    let toml_dir = toml_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let rt = tokio::runtime::Handle::current();
+    rt.block_on(build::build_image(&config, toml_dir))?;
 
     Ok(())
 }

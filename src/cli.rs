@@ -243,4 +243,8 @@ pub struct BuildArgs {
     /// Path to directory containing Corten.toml, or path to the .toml file
     #[arg(default_value = ".")]
     pub path: String,
+
+    /// Show the build plan without actually building
+    #[arg(long)]
+    pub dry_run: bool,
 }
