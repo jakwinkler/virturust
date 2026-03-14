@@ -64,7 +64,9 @@ fn require_privileges() -> Result<()> {
 
 /// Execute the `run` subcommand — pull image if needed and start a container.
 async fn cmd_run(args: corten::cli::RunArgs) -> Result<()> {
-    require_privileges()?;
+    if !args.rootless {
+        require_privileges()?;
+    }
 
     let detach = args.detach;
     let (name, tag) = parse_image_ref(&args.image);
@@ -137,6 +139,7 @@ async fn cmd_run(args: corten::cli::RunArgs) -> Result<()> {
         network_mode: args.network,
         ports,
         restart_policy: args.restart,
+        rootless: args.rootless,
     };
 
     let exit_code = container::run(&config, detach)?;
@@ -291,6 +294,9 @@ fn cmd_inspect(args: corten::cli::InspectArgs) -> Result<()> {
     }
     println!("Network:      {}", cfg.network_mode);
     println!("Restart:      {}", cfg.restart_policy);
+    if cfg.rootless {
+        println!("Rootless:     yes");
+    }
     if !cfg.ports.is_empty() {
         println!();
         println!("Ports:");

@@ -1,4 +1,4 @@
-.PHONY: build install uninstall clean test test-integration test-e2e test-all clippy check
+.PHONY: build install uninstall clean test test-integration test-e2e test-all clippy check smoke-test docker
 
 PREFIX ?= /usr/local
 BINARY = corten
@@ -70,6 +70,14 @@ uninstall:
 	@echo "Removed $(PREFIX)/bin/$(BINARY)"
 	@echo "Data at /var/lib/corten was preserved. Remove manually if desired:"
 	@echo "  sudo rm -rf /var/lib/corten"
+
+## Run smoke tests (needs root + network + pulled images)
+smoke-test: build
+	sudo ./scripts/smoke-test.sh
+
+## Build Docker image for testing
+docker:
+	docker build -t corten .
 
 ## Clean build artifacts
 clean:

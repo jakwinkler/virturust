@@ -57,6 +57,9 @@ pub struct ChildArgs {
 
     /// Path to redirect stderr to (for log capture)
     pub stderr_log: String,
+
+    /// Whether to run in rootless mode (user namespace)
+    pub rootless: bool,
 }
 
 /// Entry point for the cloned child process.
@@ -305,6 +308,9 @@ pub fn create_namespaced_process(args: ChildArgs) -> Result<i32> {
     // x86_64 stacks grow downward, so we pass the TOP of the allocation
     let stack_top = unsafe { stack.as_mut_ptr().add(STACK_SIZE) };
 
+    // Read rootless flag before boxing args
+    let rootless = args.rootless;
+
     let mut flags = libc::CLONE_NEWPID
         | libc::CLONE_NEWNS
         | libc::CLONE_NEWUTS
@@ -314,6 +320,11 @@ pub fn create_namespaced_process(args: ChildArgs) -> Result<i32> {
     // "host" mode shares the host network namespace
     if args.network_mode != "host" {
         flags |= libc::CLONE_NEWNET;
+    }
+
+    // Rootless mode: create a user namespace for unprivileged operation
+    if rootless {
+        flags |= libc::CLONE_NEWUSER;
     }
 
     // Heap-allocate the args so the pointer is valid in the child's

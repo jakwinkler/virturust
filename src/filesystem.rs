@@ -188,9 +188,10 @@ fn remount_readonly(target: &Path) -> Result<()> {
 /// essential device nodes, symlinks, and pseudo-filesystems.
 /// This is much safer than bind-mounting the host /dev.
 fn setup_minimal_dev(dev_dir: &Path) -> Result<()> {
-    // Mount tmpfs on /dev
-    mount_fs("tmpfs", dev_dir, "tmpfs", libc::MS_NOSUID | libc::MS_STRICTATIME)
-        .context("failed to mount tmpfs on /dev")?;
+    // Mount tmpfs on /dev (may fail in rootless mode without real root)
+    if mount_fs("tmpfs", dev_dir, "tmpfs", libc::MS_NOSUID | libc::MS_STRICTATIME).is_err() {
+        log::warn!("tmpfs mount on /dev failed (rootless mode?), using directory");
+    }
 
     // Create essential device nodes via mknod
     // (major, minor) pairs follow Linux device number conventions

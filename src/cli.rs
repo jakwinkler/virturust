@@ -142,6 +142,10 @@ pub struct RunArgs {
     /// Restart policy: no (default), always, on-failure[:max-retries]
     #[arg(long, default_value = "no")]
     pub restart: String,
+
+    /// Run in rootless mode (user namespace, no root required)
+    #[arg(long)]
+    pub rootless: bool,
 }
 
 /// Arguments for the `pull` subcommand.

@@ -100,6 +100,10 @@ pub struct ContainerConfig {
     /// Restart policy: "no", "always", "on-failure:N"
     #[serde(default = "default_restart_policy")]
     pub restart_policy: String,
+
+    /// Whether to run in rootless mode (user namespace)
+    #[serde(default)]
+    pub rootless: bool,
 }
 
 fn default_network_mode() -> String {

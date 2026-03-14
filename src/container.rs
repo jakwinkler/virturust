@@ -145,11 +145,17 @@ pub fn run(config: &ContainerConfig, detach: bool) -> Result<i32> {
     )
     .context("failed to save container config")?;
 
+    // In rootless mode, some features are unavailable
+    if config.rootless {
+        log::info!("rootless mode: skipping cgroups, using copy rootfs, network=none");
+    }
+
     // Set up per-container writable rootfs using OverlayFS.
     // lower = image rootfs (read-only, shared), upper = per-container writable layer.
     // Falls back to a full copy if OverlayFS is not available.
+    // In rootless mode, OverlayFS requires root, so skip it and use copy fallback.
     let overlay_dir = container_dir.join("overlay");
-    let container_rootfs = if crate::filesystem::setup_overlay(
+    let container_rootfs = if !config.rootless && crate::filesystem::setup_overlay(
         &config.rootfs,
         &overlay_dir,
     )
@@ -166,7 +172,8 @@ pub fn run(config: &ContainerConfig, detach: bool) -> Result<i32> {
     };
 
     // Set up container DNS (copy host resolv.conf into rootfs)
-    if config.network_mode != "none" {
+    // Skip in rootless mode (no network access)
+    if config.network_mode != "none" && !config.rootless {
         crate::network::setup_container_dns(&container_rootfs).ok();
     }
 
@@ -182,7 +189,8 @@ pub fn run(config: &ContainerConfig, detach: bool) -> Result<i32> {
     save_state(&container_dir, &state)?;
 
     // Set up bridge and NAT before creating the container process
-    if config.network_mode == "bridge" {
+    // Skip in rootless mode (requires CAP_NET_ADMIN)
+    if config.network_mode == "bridge" && !config.rootless {
         crate::network::ensure_bridge()
             .context("failed to set up bridge network")?;
         crate::network::setup_nat()
@@ -190,17 +198,24 @@ pub fn run(config: &ContainerConfig, detach: bool) -> Result<i32> {
     }
 
     // Create cgroup and apply resource limits
-    let cgroup = Cgroup::create(&config.id)?;
+    // Skip in rootless mode (requires root for cgroup creation)
+    let cgroup = if !config.rootless {
+        let cg = Cgroup::create(&config.id)?;
 
-    if let Some(mem) = config.resources.memory_bytes {
-        cgroup.set_memory_limit(mem)?;
-    }
-    if let Some(cpu) = config.resources.cpu_quota {
-        cgroup.set_cpu_limit(cpu)?;
-    }
-    if let Some(pids) = config.resources.pids_max {
-        cgroup.set_pids_limit(pids)?;
-    }
+        if let Some(mem) = config.resources.memory_bytes {
+            cg.set_memory_limit(mem)?;
+        }
+        if let Some(cpu) = config.resources.cpu_quota {
+            cg.set_cpu_limit(cpu)?;
+        }
+        if let Some(pids) = config.resources.pids_max {
+            cg.set_pids_limit(pids)?;
+        }
+
+        Some(cg)
+    } else {
+        None
+    };
 
     let restart_policy = parse_restart_policy(&config.restart_policy);
     let is_named_network = !matches!(config.network_mode.as_str(), "bridge" | "none" | "host");
@@ -231,6 +246,7 @@ pub fn run(config: &ContainerConfig, detach: bool) -> Result<i32> {
             network_mode: config.network_mode.clone(),
             stdout_log: container_dir.join("stdout.log").to_string_lossy().to_string(),
             stderr_log: container_dir.join("stderr.log").to_string_lossy().to_string(),
+            rootless: config.rootless,
         };
 
         let child_pid = create_namespaced_process(child_args)?;
@@ -239,12 +255,22 @@ pub fn run(config: &ContainerConfig, detach: bool) -> Result<i32> {
         unsafe { libc::close(pipe_rd) };
 
         // Add child to cgroup before it starts doing work
-        cgroup.add_process(child_pid)?;
+        if let Some(ref cg) = cgroup {
+            cg.add_process(child_pid)?;
+        }
+
+        // Set up UID/GID mappings for rootless mode.
+        // Must happen BEFORE signaling the child so it can operate as root
+        // inside the user namespace.
+        if config.rootless {
+            setup_uid_gid_mappings(child_pid)?;
+        }
 
         // Set up container networking (veth pair, IP allocation, routing)
+        // Skip in rootless mode (requires CAP_NET_ADMIN)
         let mut container_ip = String::new();
 
-        if config.network_mode == "bridge" {
+        if config.network_mode == "bridge" && !config.rootless {
             let container_net = crate::network::setup_container_network(&config.id, child_pid)
                 .context("failed to set up container network")?;
             container_ip = container_net.ip.clone();
@@ -260,7 +286,7 @@ pub fn run(config: &ContainerConfig, detach: bool) -> Result<i32> {
                 crate::network::setup_port_forwarding(&container_net.ip, &config.ports)
                     .context("failed to set up port forwarding")?;
             }
-        } else if is_named_network {
+        } else if is_named_network && !config.rootless {
             let container_net = crate::network::setup_container_named_network(
                 &config.network_mode,
                 &config.id,
@@ -336,12 +362,14 @@ pub fn run(config: &ContainerConfig, detach: bool) -> Result<i32> {
             1
         };
 
-        // Cleanup networking for this iteration
-        if !config.ports.is_empty() && !container_ip.is_empty() {
-            crate::network::cleanup_port_forwarding(&container_ip, &config.ports).ok();
-        }
-        if config.network_mode == "bridge" || is_named_network {
-            crate::network::cleanup_container_network(&config.id).ok();
+        // Cleanup networking for this iteration (skip in rootless mode)
+        if !config.rootless {
+            if !config.ports.is_empty() && !container_ip.is_empty() {
+                crate::network::cleanup_port_forwarding(&container_ip, &config.ports).ok();
+            }
+            if config.network_mode == "bridge" || is_named_network {
+                crate::network::cleanup_container_network(&config.id).ok();
+            }
         }
 
         // Check restart policy
@@ -367,8 +395,8 @@ pub fn run(config: &ContainerConfig, detach: bool) -> Result<i32> {
     state.exit_code = Some(final_exit_code);
     save_state(&container_dir, &state)?;
 
-    // Cleanup named network registration
-    if is_named_network {
+    // Cleanup named network registration (skip in rootless mode)
+    if is_named_network && !config.rootless {
         crate::network::unregister_container_from_network(
             &config.network_mode,
             &config.name,
@@ -380,13 +408,50 @@ pub fn run(config: &ContainerConfig, detach: bool) -> Result<i32> {
     crate::filesystem::cleanup_overlay(&overlay_dir).ok();
 
     // Cleanup cgroup (container state is preserved for inspection)
-    cgroup.destroy().ok();
+    if let Some(cg) = cgroup {
+        cg.destroy().ok();
+    }
 
     log::info!(
         "container '{}' exited with code {final_exit_code}",
         config.name
     );
     Ok(final_exit_code)
+}
+
+/// Set up UID/GID mappings for rootless containers.
+///
+/// Maps the current user's UID/GID to root (0) inside the container.
+/// This allows the container process to appear as root inside its
+/// user namespace while actually running as an unprivileged user.
+fn setup_uid_gid_mappings(child_pid: i32) -> Result<()> {
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+
+    // Must deny setgroups before writing gid_map (kernel requirement)
+    fs::write(
+        format!("/proc/{child_pid}/setgroups"),
+        "deny",
+    )
+    .context("failed to write setgroups deny")?;
+
+    // Map current UID to root (0) inside the container
+    // Format: <inside_id> <outside_id> <count>
+    fs::write(
+        format!("/proc/{child_pid}/uid_map"),
+        format!("0 {uid} 1"),
+    )
+    .context("failed to write uid_map")?;
+
+    // Map current GID to root (0) inside the container
+    fs::write(
+        format!("/proc/{child_pid}/gid_map"),
+        format!("0 {gid} 1"),
+    )
+    .context("failed to write gid_map")?;
+
+    log::info!("set up rootless UID/GID mappings: uid {uid} -> 0, gid {gid} -> 0");
+    Ok(())
 }
 
 /// Stop a running container by sending signals to its process.

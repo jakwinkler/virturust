@@ -1,0 +1,7 @@
+target/
+.git/
+chatgpt.review.md
+chatgpt.discussion.md
+discussion.md
+*.swp
+*.swo
