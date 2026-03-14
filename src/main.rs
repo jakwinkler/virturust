@@ -7,7 +7,11 @@ use anyhow::{anyhow, Result};
 use clap::Parser;
 
 use virturust::cli::{Cli, Commands};
-use virturust::config::{self, parse_image_ref, parse_memory, ContainerConfig, ResourceLimits};
+use virturust::config::{
+    self, has_cap_sys_admin, parse_image_ref, parse_memory, ContainerConfig, ContainerStatus,
+    ResourceLimits,
+};
+use virturust::container;
 use virturust::image;
 
 #[tokio::main]
@@ -25,21 +29,36 @@ async fn main() -> Result<()> {
         Commands::Pull(args) => cmd_pull(args).await?,
         Commands::Images => cmd_images()?,
         Commands::Ps => cmd_ps()?,
+        Commands::Stop(args) => cmd_stop(args)?,
+        Commands::Inspect(args) => cmd_inspect(args)?,
         Commands::Rm(args) => cmd_rm(args)?,
     }
 
     Ok(())
 }
 
+/// Verify we have the privileges needed for container operations.
+///
+/// Accepts either root (sudo) or Linux capabilities set via `setcap`.
+/// After `make install`, capabilities are set on the binary so sudo
+/// is not required.
+fn require_privileges() -> Result<()> {
+    if has_cap_sys_admin() {
+        return Ok(());
+    }
+
+    Err(anyhow!(
+        "insufficient privileges for container operations.\n\n\
+         Option 1 (recommended): Install with capabilities (one-time sudo):\n\
+         \x20 make install\n\n\
+         Option 2: Run with sudo:\n\
+         \x20 sudo virturust run ..."
+    ))
+}
+
 /// Execute the `run` subcommand — pull image if needed and start a container.
 async fn cmd_run(args: virturust::cli::RunArgs) -> Result<()> {
-    // Namespace creation requires root privileges
-    if !nix::unistd::geteuid().is_root() {
-        return Err(anyhow!(
-            "virturust must be run as root (required for namespace creation).\n\
-             Try: sudo virturust run ..."
-        ));
-    }
+    require_privileges()?;
 
     let (name, tag) = parse_image_ref(&args.image);
 
@@ -80,7 +99,7 @@ async fn cmd_run(args: virturust::cli::RunArgs) -> Result<()> {
         rootfs,
     };
 
-    let exit_code = virturust::container::run(&config)?;
+    let exit_code = container::run(&config)?;
     std::process::exit(exit_code);
 }
 
@@ -109,7 +128,7 @@ fn cmd_images() -> Result<()> {
     Ok(())
 }
 
-/// Execute the `ps` subcommand — list containers.
+/// Execute the `ps` subcommand — list all containers with live status.
 fn cmd_ps() -> Result<()> {
     let dir = config::containers_dir();
 
@@ -120,27 +139,45 @@ fn cmd_ps() -> Result<()> {
 
     let mut found = false;
     println!(
-        "{:<14} {:<15} {:<20} {:<10}",
-        "CONTAINER ID", "NAME", "IMAGE", "STATUS"
+        "{:<14} {:<15} {:<20} {:<10} {:<10}",
+        "CONTAINER ID", "NAME", "IMAGE", "STATUS", "EXIT CODE"
     );
-    println!("{}", "-".repeat(60));
+    println!("{}", "-".repeat(70));
 
     for entry in std::fs::read_dir(&dir)? {
         let entry = entry?;
-        let config_path = entry.path().join("config.json");
-        if config_path.exists() {
-            let data = std::fs::read_to_string(&config_path)?;
-            if let Ok(cfg) = serde_json::from_str::<ContainerConfig>(&data) {
-                found = true;
-                println!(
-                    "{:<14} {:<15} {:<20} {:<10}",
-                    &cfg.id[..12],
-                    cfg.name,
-                    cfg.image,
-                    "running"
-                );
+        let path = entry.path();
+
+        let Ok(cfg) = container::load_config(&path) else {
+            continue;
+        };
+        let Ok(mut state) = container::load_state(&path) else {
+            continue;
+        };
+
+        // Check if a "running" container is actually still alive
+        if state.status == ContainerStatus::Running {
+            if let Some(pid) = state.pid {
+                if !container::is_process_alive(pid) {
+                    state.status = ContainerStatus::Stopped;
+                }
             }
         }
+
+        found = true;
+        let exit_str = state
+            .exit_code
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "-".to_string());
+
+        println!(
+            "{:<14} {:<15} {:<20} {:<10} {:<10}",
+            &cfg.id[..12],
+            cfg.name,
+            cfg.image,
+            state.status,
+            exit_str
+        );
     }
 
     if !found {
@@ -150,14 +187,91 @@ fn cmd_ps() -> Result<()> {
     Ok(())
 }
 
+/// Execute the `stop` subcommand — stop a running container.
+fn cmd_stop(args: virturust::cli::StopArgs) -> Result<()> {
+    require_privileges()?;
+
+    let container_dir = container::find_container(&args.name)?;
+    container::stop(&container_dir, args.time)
+}
+
+/// Execute the `inspect` subcommand — show detailed container info.
+fn cmd_inspect(args: virturust::cli::InspectArgs) -> Result<()> {
+    let container_dir = container::find_container(&args.name)?;
+    let cfg = container::load_config(&container_dir)?;
+    let mut state = container::load_state(&container_dir)?;
+
+    // Live status check
+    if state.status == ContainerStatus::Running {
+        if let Some(pid) = state.pid {
+            if !container::is_process_alive(pid) {
+                state.status = ContainerStatus::Stopped;
+            }
+        }
+    }
+
+    println!("Container:    {}", cfg.id);
+    println!("Name:         {}", cfg.name);
+    println!("Image:        {}", cfg.image);
+    println!("Command:      {:?}", cfg.command);
+    println!("Hostname:     {}", cfg.hostname);
+    println!("Status:       {}", state.status);
+    println!("PID:          {}", state.pid.map(|p| p.to_string()).unwrap_or("-".into()));
+    println!("Created:      {}", state.created_at);
+    println!("Started:      {}", state.started_at.map(|t| t.to_string()).unwrap_or("-".into()));
+    println!("Finished:     {}", state.finished_at.map(|t| t.to_string()).unwrap_or("-".into()));
+    println!("Exit code:    {}", state.exit_code.map(|c| c.to_string()).unwrap_or("-".into()));
+    println!();
+    println!("Resource limits:");
+    println!("  Memory:     {}", cfg.resources.memory_bytes
+        .map(|b| format_bytes(b))
+        .unwrap_or("unlimited".into()));
+    println!("  CPUs:       {}", cfg.resources.cpu_quota
+        .map(|c| format!("{c}"))
+        .unwrap_or("unlimited".into()));
+    println!("  PIDs max:   {}", cfg.resources.pids_max
+        .map(|p| p.to_string())
+        .unwrap_or("unlimited".into()));
+    println!();
+    println!("Rootfs:       {}", cfg.rootfs.display());
+
+    Ok(())
+}
+
+/// Format bytes into a human-readable string.
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.1} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    } else if bytes >= 1024 * 1024 {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 /// Execute the `rm` subcommand — remove a stopped container.
 fn cmd_rm(args: virturust::cli::RmArgs) -> Result<()> {
-    let dir = config::containers_dir().join(&args.name);
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir)?;
-        println!("Removed container: {}", args.name);
-    } else {
-        println!("Container not found: {}", args.name);
+    let container_dir = container::find_container(&args.name)?;
+    let cfg = container::load_config(&container_dir)?;
+
+    // Don't remove running containers
+    if let Ok(state) = container::load_state(&container_dir) {
+        if state.status == ContainerStatus::Running {
+            if let Some(pid) = state.pid {
+                if container::is_process_alive(pid) {
+                    return Err(anyhow!(
+                        "cannot remove running container '{}'. Stop it first: virturust stop {}",
+                        cfg.name,
+                        cfg.name
+                    ));
+                }
+            }
+        }
     }
+
+    std::fs::remove_dir_all(&container_dir)?;
+    println!("Removed container: {} ({})", cfg.name, &cfg.id[..12]);
     Ok(())
 }

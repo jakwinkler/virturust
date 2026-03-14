@@ -117,3 +117,39 @@ fn cli_verbose_short_flag_accepted() {
     let output = run_virturust(&["-v", "--help"]);
     assert!(output.status.success());
 }
+
+#[test]
+fn cli_stop_help() {
+    let output = run_virturust(&["stop", "--help"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Stop"));
+    assert!(stdout.contains("--time"));
+}
+
+#[test]
+fn cli_stop_requires_name() {
+    let output = run_virturust(&["stop"]);
+    assert!(!output.status.success());
+}
+
+#[test]
+fn cli_inspect_help() {
+    let output = run_virturust(&["inspect", "--help"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("detailed"));
+}
+
+#[test]
+fn cli_inspect_requires_name() {
+    let output = run_virturust(&["inspect"]);
+    assert!(!output.status.success());
+}
+
+#[test]
+fn cli_stop_default_timeout() {
+    let output = run_virturust(&["stop", "--help"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("10"));
+}

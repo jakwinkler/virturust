@@ -52,9 +52,97 @@ pub struct ContainerConfig {
     pub rootfs: PathBuf,
 }
 
+/// Runtime state of a container instance.
+///
+/// Persisted to `<containers_dir>/<id>/state.json` and updated
+/// throughout the container lifecycle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContainerState {
+    /// Current lifecycle status
+    pub status: ContainerStatus,
+
+    /// Container process PID (host namespace). Set when running.
+    pub pid: Option<i32>,
+
+    /// Unix timestamp when the container was created
+    pub created_at: u64,
+
+    /// Unix timestamp when the container started running
+    pub started_at: Option<u64>,
+
+    /// Unix timestamp when the container exited
+    pub finished_at: Option<u64>,
+
+    /// Exit code of the container process (set after exit)
+    pub exit_code: Option<i32>,
+}
+
+/// Lifecycle status of a container.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum ContainerStatus {
+    /// Container metadata created, not yet started
+    Created,
+    /// Container process is running
+    Running,
+    /// Container process has exited
+    Stopped,
+}
+
+impl std::fmt::Display for ContainerStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Created => write!(f, "created"),
+            Self::Running => write!(f, "running"),
+            Self::Stopped => write!(f, "stopped"),
+        }
+    }
+}
+
+/// Get the current Unix timestamp in seconds.
+pub fn unix_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// Check if the current process has CAP_SYS_ADMIN capability.
+///
+/// This allows running without sudo when Linux capabilities are set
+/// on the binary via `setcap`. Reads the effective capabilities from
+/// `/proc/self/status`.
+pub fn has_cap_sys_admin() -> bool {
+    if nix::unistd::geteuid().is_root() {
+        return true;
+    }
+
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return false;
+    };
+
+    for line in status.lines() {
+        if let Some(hex) = line.strip_prefix("CapEff:\t") {
+            if let Ok(caps) = u64::from_str_radix(hex.trim(), 16) {
+                // CAP_SYS_ADMIN is bit 21
+                return caps & (1 << 21) != 0;
+            }
+        }
+    }
+
+    false
+}
+
 /// Base directory for all VirtuRust data.
+///
+/// Defaults to `/var/lib/virturust`. Can be overridden with the
+/// `VIRTURUST_DATA_DIR` environment variable.
 pub fn data_dir() -> PathBuf {
-    PathBuf::from("/var/lib/virturust")
+    if let Ok(dir) = std::env::var("VIRTURUST_DATA_DIR") {
+        PathBuf::from(dir)
+    } else {
+        PathBuf::from("/var/lib/virturust")
+    }
 }
 
 /// Directory where pulled images are stored.

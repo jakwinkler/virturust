@@ -34,38 +34,53 @@ stat -f -c %T /sys/fs/cgroup
 
 ## Installation
 
-### From source
+### From source (recommended)
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/virturust.git
+git clone https://github.com/jakwinkler/virturust.git
 cd virturust
-cargo build --release
 
-# The binary is at target/release/virturust
+# Build and install with Linux capabilities (one-time sudo)
+make install
+```
+
+After installation, **no sudo needed** — Linux capabilities grant only the
+specific privileges required for container operations.
+
+### Manual install
+
+```bash
+cargo build --release
 sudo cp target/release/virturust /usr/local/bin/
 ```
+
+### Environment variables
+
+| Variable             | Default              | Description               |
+|----------------------|----------------------|---------------------------|
+| `VIRTURUST_DATA_DIR` | `/var/lib/virturust` | Image and container store |
 
 ## Usage
 
 ### Pull an image
 
 ```bash
-sudo virturust pull alpine
-sudo virturust pull ubuntu:22.04
-sudo virturust pull debian:bookworm
+virturust pull alpine
+virturust pull ubuntu:22.04
+virturust pull debian:bookworm
 ```
 
 ### Run a container
 
 ```bash
 # Basic — run an interactive shell
-sudo virturust run alpine /bin/sh
+virturust run alpine /bin/sh
 
 # With resource limits
-sudo virturust run --memory 256m --cpus 0.5 alpine /bin/sh
+virturust run --memory 256m --cpus 0.5 alpine /bin/sh
 
 # Full control
-sudo virturust run \
+virturust run \
   --memory 1g \
   --cpus 2 \
   --pids-limit 100 \
@@ -74,7 +89,7 @@ sudo virturust run \
   ubuntu:22.04 /bin/bash
 
 # Run a one-off command
-sudo virturust run alpine cat /etc/os-release
+virturust run alpine cat /etc/os-release
 ```
 
 ### Resource limits
@@ -85,22 +100,24 @@ sudo virturust run alpine cat /etc/os-release
 | `--cpus`        | CPU limit (fractional cores)   | `--cpus 0.5`     |
 | `--pids-limit`  | Max number of processes        | `--pids-limit 50`|
 
-### List images
+### Container management
 
 ```bash
-sudo virturust images
-```
+# List all containers (running and stopped)
+virturust ps
 
-### List containers
+# Inspect a container's details
+virturust inspect <name-or-id>
 
-```bash
-sudo virturust ps
-```
+# Stop a running container (SIGTERM, then SIGKILL after timeout)
+virturust stop <name-or-id>
+virturust stop --time 30 <name-or-id>
 
-### Remove a container
+# Remove a stopped container
+virturust rm <name-or-id>
 
-```bash
-sudo virturust rm <container-id>
+# List locally cached images
+virturust images
 ```
 
 ## Architecture
@@ -130,7 +147,7 @@ VirtuRust is structured around Linux kernel isolation primitives:
 |----------------|----------------------------------------------------|
 | `cli`          | Command-line argument parsing (clap derive)        |
 | `config`       | Configuration types, resource limit parsing        |
-| `container`    | Container lifecycle (create → run → cleanup)       |
+| `container`    | Container lifecycle (create → run → stop → cleanup)|
 | `namespace`    | Linux namespace creation via `clone()`             |
 | `cgroup`       | cgroups v2 resource limit enforcement              |
 | `filesystem`   | Mount setup, `pivot_root`, filesystem isolation    |

@@ -31,8 +31,14 @@ pub enum Commands {
     /// List locally available images
     Images,
 
-    /// List running containers
+    /// List containers (running and stopped)
     Ps,
+
+    /// Stop a running container
+    Stop(StopArgs),
+
+    /// Show detailed information about a container
+    Inspect(InspectArgs),
 
     /// Remove a stopped container
     Rm(RmArgs),
@@ -79,6 +85,24 @@ pub struct RunArgs {
 pub struct PullArgs {
     /// Image to pull (e.g., "alpine", "ubuntu:22.04", "debian:bookworm")
     pub image: String,
+}
+
+/// Arguments for the `stop` subcommand.
+#[derive(clap::Args, Debug)]
+pub struct StopArgs {
+    /// Container name or ID to stop
+    pub name: String,
+
+    /// Seconds to wait before sending SIGKILL (default: 10)
+    #[arg(short, long, default_value = "10")]
+    pub time: u64,
+}
+
+/// Arguments for the `inspect` subcommand.
+#[derive(clap::Args, Debug)]
+pub struct InspectArgs {
+    /// Container name or ID to inspect
+    pub name: String,
 }
 
 /// Arguments for the `rm` subcommand.
