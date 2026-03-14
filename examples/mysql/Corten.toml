@@ -1,0 +1,31 @@
+# MySQL (MariaDB) on Alpine
+#
+# Build:  sudo corten build examples/mysql
+# Run:    sudo corten run -d -p 3306:3306 --name mydb my-mysql
+# Test:   mysql -h 127.0.0.1 -u root -proot123
+
+[image]
+name = "my-mysql"
+tag = "latest"
+
+[base]
+system = "alpine"
+version = "3.20"
+
+[packages]
+install = ["mariadb", "mariadb-client"]
+
+[env]
+MYSQL_ROOT_PASSWORD = "root123"
+
+[setup]
+run = [
+    "mkdir -p /run/mysqld /var/lib/mysql",
+    "chown -R mysql:mysql /run/mysqld /var/lib/mysql",
+    "mysql_install_db --user=mysql --datadir=/var/lib/mysql",
+]
+
+[container]
+command = ["mysqld", "--user=mysql", "--datadir=/var/lib/mysql"]
+user = "mysql"
+expose = [3306]

@@ -1,0 +1,27 @@
+# Nginx web server on Alpine
+#
+# Build:  sudo corten build examples/nginx
+# Run:    sudo corten run -p 8080:80 my-nginx
+# Test:   curl http://localhost:8080
+
+[image]
+name = "my-nginx"
+tag = "latest"
+
+[base]
+system = "alpine"
+version = "3.20"
+
+[packages]
+install = ["nginx"]
+
+[setup]
+run = [
+    "mkdir -p /run/nginx",
+    "mkdir -p /var/www/html",
+    "echo '<h1>Hello from Corten!</h1><p>Nginx running on Alpine, built without Docker.</p>' > /var/www/html/index.html",
+]
+
+[container]
+command = ["nginx", "-g", "daemon off;"]
+expose = [80]
