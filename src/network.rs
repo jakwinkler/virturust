@@ -99,42 +99,93 @@ pub fn ensure_bridge() -> Result<()> {
         .context("failed to enable IP forwarding")?;
     log::info!("IP forwarding enabled");
 
+    // On systems with firewalld (Fedora, RHEL, CentOS), add the bridge
+    // to the trusted zone so container traffic isn't blocked by the firewall.
+    if Command::new("firewall-cmd").arg("--state").output()
+        .map(|o| o.status.success()).unwrap_or(false)
+    {
+        run_cmd("firewall-cmd", &[
+            "--zone=trusted",
+            &format!("--add-interface={BRIDGE_NAME}"),
+        ]).ok();
+
+        run_cmd("firewall-cmd", &["--zone=trusted", "--add-masquerade"]).ok();
+
+        log::info!("added {BRIDGE_NAME} to firewalld trusted zone");
+    }
+
+    // Disable bridge netfilter — prevents iptables/nftables from
+    // filtering traffic that's already on the bridge (local traffic).
+    fs::write("/proc/sys/net/bridge/bridge-nf-call-iptables", "0").ok();
+    fs::write("/proc/sys/net/bridge/bridge-nf-call-ip6tables", "0").ok();
+
     Ok(())
 }
 
 /// Set up NAT (masquerade) rules for outbound container traffic.
 ///
-/// Adds an iptables MASQUERADE rule for the 10.0.42.0/24 subnet so
-/// containers can reach the internet through the host. Checks if the
-/// rule already exists before adding it.
+/// Tries firewalld first (Fedora/RHEL), then iptables, then nftables.
 pub fn setup_nat() -> Result<()> {
-    // Check if the MASQUERADE rule already exists
-    let output = Command::new("iptables")
-        .args([
-            "-t", "nat", "-C", "POSTROUTING",
-            "-s", BRIDGE_SUBNET,
-            "-j", "MASQUERADE",
-        ])
-        .output()
-        .context("failed to check iptables NAT rule")?;
-
-    if output.status.success() {
-        log::info!("NAT masquerade rule already exists for {BRIDGE_SUBNET}");
+    // Method 1: firewalld (Fedora, RHEL, CentOS)
+    if Command::new("firewall-cmd").arg("--state").output()
+        .map(|o| o.status.success()).unwrap_or(false)
+    {
+        // firewalld handles masquerade via the trusted zone (set in ensure_bridge)
+        log::info!("NAT handled by firewalld trusted zone masquerade");
         return Ok(());
     }
 
-    // Add the MASQUERADE rule
-    run_cmd(
-        "iptables",
-        &[
-            "-t", "nat", "-A", "POSTROUTING",
-            "-s", BRIDGE_SUBNET,
-            "-j", "MASQUERADE",
-        ],
-    )
-    .context("failed to add iptables MASQUERADE rule")?;
+    // Method 2: iptables (Ubuntu, Debian, older systems)
+    if Command::new("iptables").arg("--version").output().is_ok() {
+        // Check if the MASQUERADE rule already exists
+        let output = Command::new("iptables")
+            .args(["-t", "nat", "-C", "POSTROUTING", "-s", BRIDGE_SUBNET, "-j", "MASQUERADE"])
+            .output();
 
-    log::info!("added NAT masquerade rule for {BRIDGE_SUBNET}");
+        if let Ok(out) = output {
+            if out.status.success() {
+                log::info!("NAT masquerade rule already exists for {BRIDGE_SUBNET}");
+                return Ok(());
+            }
+        }
+
+        run_cmd("iptables", &["-t", "nat", "-A", "POSTROUTING", "-s", BRIDGE_SUBNET, "-j", "MASQUERADE"]).ok();
+        run_cmd("iptables", &["-A", "FORWARD", "-s", BRIDGE_SUBNET, "-j", "ACCEPT"]).ok();
+        run_cmd("iptables", &["-A", "FORWARD", "-d", BRIDGE_SUBNET, "-j", "ACCEPT"]).ok();
+        log::info!("added iptables NAT masquerade for {BRIDGE_SUBNET}");
+        return Ok(());
+    }
+
+    // Method 3: nftables directly (modern Fedora without iptables compat)
+    if Command::new("nft").arg("list").arg("ruleset").output().is_ok() {
+        run_cmd("nft", &[
+            "add", "table", "ip", "corten",
+        ]).ok();
+        run_cmd("nft", &[
+            "add", "chain", "ip", "corten", "postrouting",
+            "{ type nat hook postrouting priority 100 ; }",
+        ]).ok();
+        run_cmd("nft", &[
+            "add", "rule", "ip", "corten", "postrouting",
+            "ip", "saddr", BRIDGE_SUBNET, "masquerade",
+        ]).ok();
+        run_cmd("nft", &[
+            "add", "chain", "ip", "corten", "forward",
+            "{ type filter hook forward priority 0 ; }",
+        ]).ok();
+        run_cmd("nft", &[
+            "add", "rule", "ip", "corten", "forward",
+            "ip", "saddr", BRIDGE_SUBNET, "accept",
+        ]).ok();
+        run_cmd("nft", &[
+            "add", "rule", "ip", "corten", "forward",
+            "ip", "daddr", BRIDGE_SUBNET, "accept",
+        ]).ok();
+        log::info!("added nftables NAT masquerade for {BRIDGE_SUBNET}");
+        return Ok(());
+    }
+
+    log::warn!("no firewall tool found (firewalld/iptables/nft) — NAT may not work");
 
     // Allow forwarding for container traffic (FORWARD chain may default to DROP)
     run_cmd(
