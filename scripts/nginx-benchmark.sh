@@ -102,12 +102,13 @@ install = ["nginx"]
 
 [setup]
 run = [
-    "mkdir -p /run/nginx /var/www/html",
+    "mkdir -p /run/nginx /var/www/html /var/log/nginx /var/lib/nginx/tmp",
     "echo '<h1>Corten Nginx</h1>' > /var/www/html/index.html",
+    "chown -R nginx:nginx /run/nginx /var/log/nginx /var/lib/nginx",
 ]
 
 [container]
-command = ["nginx", "-g", "daemon off;"]
+command = ["sh", "-c", "mkdir -p /run/nginx && nginx -g 'daemon off;'"]
 TOML
 
 START=$(date +%s%N)
@@ -139,20 +140,41 @@ echo "  Corten start: ${CORTEN_START_MS}ms (port $CORTEN_PORT)"
 
 # Wait for both to be ready
 echo "  Waiting for nginx..."
+DOCKER_OK=false
+CORTEN_OK=false
 for i in $(seq 1 30); do
-    DOCKER_UP=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:$DOCKER_PORT/ 2>/dev/null || echo "000")
-    CORTEN_UP=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:$CORTEN_PORT/ 2>/dev/null || echo "000")
-    if [ "$DOCKER_UP" = "200" ] && [ "$CORTEN_UP" = "200" ]; then
-        break
+    if ! $DOCKER_OK; then
+        DOCKER_UP=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:$DOCKER_PORT/ 2>/dev/null || echo "000")
+        [ "$DOCKER_UP" = "200" ] && DOCKER_OK=true
     fi
-    sleep 0.5
+    if ! $CORTEN_OK; then
+        CORTEN_UP=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:$CORTEN_PORT/ 2>/dev/null || echo "000")
+        [ "$CORTEN_UP" = "200" ] && CORTEN_OK=true
+    fi
+    $DOCKER_OK && $CORTEN_OK && break
+    sleep 1
 done
 
 # Verify both are serving
-echo -n "  Docker response: "
-curl -s http://127.0.0.1:$DOCKER_PORT/ | head -1
-echo -n "  Corten response: "
-curl -s http://127.0.0.1:$CORTEN_PORT/ | head -1
+echo -n "  Docker: "
+if $DOCKER_OK; then
+    curl -s http://127.0.0.1:$DOCKER_PORT/ | head -1
+else
+    red "NOT RESPONDING on port $DOCKER_PORT"
+fi
+echo -n "  Corten: "
+if $CORTEN_OK; then
+    curl -s http://127.0.0.1:$CORTEN_PORT/ | head -1
+else
+    red "NOT RESPONDING on port $CORTEN_PORT"
+    echo "  Checking logs..."
+    $CORTEN logs bench-corten-nginx 2>/dev/null || echo "  (no logs)"
+fi
+
+if ! $DOCKER_OK || ! $CORTEN_OK; then
+    red "  One or both containers failed to start. Aborting benchmark."
+    exit 1
+fi
 
 echo ""
 
