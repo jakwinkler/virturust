@@ -114,6 +114,30 @@ pub fn ensure_bridge() -> Result<()> {
         log::info!("added {BRIDGE_NAME} to firewalld trusted zone");
     }
 
+    // If Docker is running, its FORWARD chain has policy DROP and routes
+    // everything through DOCKER-USER first. Insert our ACCEPT rules there
+    // so Corten bridge traffic isn't blocked by Docker's firewall.
+    let docker_user_exists = Command::new("iptables")
+        .args(["-L", "DOCKER-USER", "-n"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if docker_user_exists {
+        // Check if rules already exist before inserting
+        let already_has_rule = Command::new("iptables")
+            .args(["-C", "DOCKER-USER", "-s", BRIDGE_SUBNET, "-j", "ACCEPT"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        if !already_has_rule {
+            run_cmd("iptables", &["-I", "DOCKER-USER", "-s", BRIDGE_SUBNET, "-j", "ACCEPT"]).ok();
+            run_cmd("iptables", &["-I", "DOCKER-USER", "-d", BRIDGE_SUBNET, "-j", "ACCEPT"]).ok();
+            log::info!("added ACCEPT rules to DOCKER-USER chain for {BRIDGE_SUBNET}");
+        }
+    }
+
     // Disable bridge netfilter — prevents iptables/nftables from
     // filtering traffic that's already on the bridge (local traffic).
     fs::write("/proc/sys/net/bridge/bridge-nf-call-iptables", "0").ok();
