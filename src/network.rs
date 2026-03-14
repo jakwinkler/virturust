@@ -523,6 +523,61 @@ pub fn cleanup_port_forwarding(
     Ok(())
 }
 
+/// Flush all corten-related iptables DNAT rules (for system prune).
+///
+/// Removes any PREROUTING/OUTPUT rules targeting the corten subnet.
+pub fn flush_port_forwarding() {
+    // Remove all DNAT rules targeting 10.0.42.x from PREROUTING and OUTPUT
+    for chain in &["PREROUTING", "OUTPUT"] {
+        // Keep removing matching rules until none left
+        loop {
+            let output = Command::new("iptables")
+                .args(["-t", "nat", "-S", chain])
+                .output();
+            let Ok(output) = output else { break };
+            let rules = String::from_utf8_lossy(&output.stdout);
+            let rule_to_delete = rules.lines().find(|line| {
+                line.contains("DNAT") && line.contains("10.0.42.")
+            });
+            if let Some(rule) = rule_to_delete {
+                // Convert -A to -D for deletion
+                let delete_rule = rule.replacen("-A", "-D", 1);
+                let args: Vec<&str> = delete_rule.split_whitespace().collect();
+                let mut cmd = Command::new("iptables");
+                cmd.arg("-t").arg("nat");
+                for arg in &args {
+                    cmd.arg(arg);
+                }
+                cmd.output().ok();
+            } else {
+                break;
+            }
+        }
+    }
+    log::info!("flushed all corten port forwarding rules");
+}
+
+/// Clean up all stale corten veth interfaces.
+pub fn cleanup_stale_veths() {
+    let output = Command::new("ip").args(["link", "show"]).output();
+    if let Ok(output) = output {
+        let links = String::from_utf8_lossy(&output.stdout);
+        for line in links.lines() {
+            // Match veth-XXXXXXXX (corten veth host side)
+            if let Some(start) = line.find("veth-") {
+                let name: String = line[start..].chars().take_while(|c| !c.is_whitespace() && *c != '@').collect();
+                if name.starts_with("veth-") && name.len() <= 14 {
+                    // Check if it's NO-CARRIER (peer is gone)
+                    if line.contains("NO-CARRIER") || line.contains("LOWERLAYERDOWN") {
+                        run_cmd("ip", &["link", "del", &name]).ok();
+                        log::info!("cleaned up stale veth: {name}");
+                    }
+                }
+            }
+        }
+    }
+}
+
 // =============================================================================
 // Named networks
 // =============================================================================

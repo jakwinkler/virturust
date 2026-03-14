@@ -802,6 +802,10 @@ fn cmd_system_prune() -> Result<()> {
     }
     println!("Removed {removed_containers} stopped container(s).");
 
+    // Clean up stale network resources
+    corten::network::flush_port_forwarding();
+    corten::network::cleanup_stale_veths();
+
     // Then prune images
     cmd_image_prune()?;
     Ok(())
