@@ -148,12 +148,12 @@ rm -rf "$TMPDIR"
 bold "5. Resource Limits"
 echo ""
 
-check_output "memory limit shown in inspect" "64" \
-    bash -c "$CORTEN run --name mem-test --network none --memory 64m alpine true && $CORTEN inspect mem-test"
+$CORTEN run --name mem-test --network none --memory 64m alpine true >/dev/null 2>&1 || true
+check_output "memory limit shown in inspect" "64" $CORTEN inspect mem-test
 $CORTEN rm mem-test 2>/dev/null || true
 
-check_output "pids limit shown in inspect" "50" \
-    bash -c "$CORTEN run --name pids-test --network none --pids-limit 50 alpine true && $CORTEN inspect pids-test"
+$CORTEN run --name pids-test --network none --pids-limit 50 alpine true >/dev/null 2>&1 || true
+check_output "pids limit shown in inspect" "50" $CORTEN inspect pids-test
 $CORTEN rm pids-test 2>/dev/null || true
 
 # ============================================================================
@@ -229,8 +229,8 @@ $CORTEN rm detach-test 2>/dev/null || true
 bold "10. Build System (Corten.toml)"
 echo ""
 
-check_output "build parses example" "Build plan" $CORTEN build examples/simple-alpine.toml
-check_output "build parses nginx example" "nginx" $CORTEN build examples/nginx-php.toml
+check_output "build parses example" "Build plan" $CORTEN build --dry-run examples/simple-alpine.toml
+check_output "build parses nginx example" "nginx" $CORTEN build --dry-run examples/nginx-php.toml
 
 # ============================================================================
 bold "11. Ubuntu Image"

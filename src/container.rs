@@ -244,8 +244,16 @@ pub fn run(config: &ContainerConfig, detach: bool) -> Result<i32> {
             working_dir: config.working_dir.clone(),
             user: config.user.clone(),
             network_mode: config.network_mode.clone(),
-            stdout_log: container_dir.join("stdout.log").to_string_lossy().to_string(),
-            stderr_log: container_dir.join("stderr.log").to_string_lossy().to_string(),
+            stdout_log: if detach {
+                container_dir.join("stdout.log").to_string_lossy().to_string()
+            } else {
+                String::new()
+            },
+            stderr_log: if detach {
+                container_dir.join("stderr.log").to_string_lossy().to_string()
+            } else {
+                String::new()
+            },
             rootless: config.rootless,
         };
 
