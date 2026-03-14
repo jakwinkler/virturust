@@ -351,13 +351,31 @@ pub fn run(config: &ContainerConfig, detach: bool) -> Result<i32> {
             println!("Container '{}' started (PID {})", config.name, child_pid);
         }
 
-        // In detach mode, return immediately without waiting for the child
+        // In detach mode, fork a monitor process and return immediately.
+        // The monitor keeps the container child alive and cleans up when it exits.
         if detach {
-            println!("{}", config.id);
-            return Ok(0);
+            let monitor_pid = unsafe { libc::fork() };
+            if monitor_pid < 0 {
+                return Err(anyhow!("fork failed: {}", std::io::Error::last_os_error()));
+            }
+            if monitor_pid > 0 {
+                // Original process — return to user immediately
+                println!("{}", config.id);
+                return Ok(0);
+            }
+            // Monitor process — detach from terminal, wait for child, cleanup
+            unsafe {
+                libc::setsid(); // new session, detach from terminal
+            }
+            // Close stdin/stdout/stderr so we don't hold the terminal
+            unsafe {
+                libc::close(0);
+                libc::close(1);
+                libc::close(2);
+            }
         }
 
-        // Wait for the container process to exit
+        // Wait for the container process to exit (foreground or monitor)
         let mut wait_status: libc::c_int = 0;
         let ret = unsafe { libc::waitpid(child_pid, &mut wait_status, 0) };
         if ret == -1 {
