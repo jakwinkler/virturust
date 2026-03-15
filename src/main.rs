@@ -18,6 +18,14 @@ use corten::image;
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // Elevate to root if we have CAP_SETUID (from make install).
+    // This allows all child processes (ip, iptables, nsenter, chroot)
+    // and netlink operations to work without sudo.
+    unsafe {
+        libc::setegid(0);
+        libc::seteuid(0);
+    }
+
     // Configure logging — default to "info", use "debug" with --verbose
     let log_level = if cli.verbose { "debug" } else { "info" };
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level))
