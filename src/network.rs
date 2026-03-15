@@ -831,11 +831,11 @@ fn start_network_dns(network_name: &str, info: &NetworkInfo) -> Result<()> {
     // Use --interface + --bind-dynamic to ONLY listen on the bridge interface
     let output = root_cmd("dnsmasq")
         .args([
-            "--conf-file=/dev/null",  // ignore system config
+            "--conf-file=/dev/null",
             "--no-resolv",
             "--no-hosts",
             "--bind-dynamic",
-            &format!("--interface={}", info.bridge),
+            &format!("--listen-address={}", info.gateway),
             &format!("--addn-hosts={}", hosts_file.display()),
             &format!("--pid-file={}", pid_file.display()),
         ])
@@ -853,7 +853,7 @@ fn start_network_dns(network_name: &str, info: &NetworkInfo) -> Result<()> {
                 "--no-resolv",
                 "--no-hosts",
                 "--bind-dynamic",
-                &format!("--interface={}", info.bridge),
+                &format!("--listen-address={}", info.gateway),
                 &format!("--addn-hosts={}", hosts_file.display()),
                 &format!("--pid-file={}", pid_file.display()),
             ])
