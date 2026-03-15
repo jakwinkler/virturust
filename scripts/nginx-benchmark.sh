@@ -264,8 +264,8 @@ DOCKER_IMG_SIZE=$(docker image inspect bench-nginx --format '{{.Size}}' 2>/dev/n
 DOCKER_IMG_MB=$((DOCKER_IMG_SIZE / 1024 / 1024))
 echo "  Docker image:  ${DOCKER_IMG_MB} MB"
 
-CORTEN_ROOTFS=$(du -s /var/lib/corten/images/bench-nginx/latest/rootfs 2>/dev/null | cut -f1 || echo "0")
-CORTEN_IMG_MB=$((CORTEN_ROOTFS / 1024))
+CORTEN_ROOTFS=$(du -sb /var/lib/corten/images/bench-nginx/latest/rootfs 2>/dev/null | cut -f1 || echo "0")
+CORTEN_IMG_MB=$((CORTEN_ROOTFS / 1024 / 1024))
 echo "  Corten rootfs: ${CORTEN_IMG_MB} MB"
 
 echo ""
