@@ -828,13 +828,13 @@ fn start_network_dns(network_name: &str, info: &NetworkInfo) -> Result<()> {
     fs::write(&hosts_file, &hosts)?;
 
     // Start dnsmasq in daemon mode (forks to background, writes PID file)
+    // Use --interface + --bind-dynamic to ONLY listen on the bridge interface
     let output = root_cmd("dnsmasq")
         .args([
             "--no-resolv",
             "--no-hosts",
-            "--bind-interfaces",
-            "--except-interface=lo",
-            &format!("--listen-address={}", info.gateway),
+            "--bind-dynamic",
+            &format!("--interface={}", info.bridge),
             &format!("--addn-hosts={}", hosts_file.display()),
             &format!("--pid-file={}", pid_file.display()),
         ])
@@ -850,9 +850,8 @@ fn start_network_dns(network_name: &str, info: &NetworkInfo) -> Result<()> {
                 "--user=root",
                 "--no-resolv",
                 "--no-hosts",
-                "--bind-interfaces",
-                "--except-interface=lo",
-                &format!("--listen-address={}", info.gateway),
+                "--bind-dynamic",
+                &format!("--interface={}", info.bridge),
                 &format!("--addn-hosts={}", hosts_file.display()),
                 &format!("--pid-file={}", pid_file.display()),
             ])
