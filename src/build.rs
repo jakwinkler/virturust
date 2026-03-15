@@ -65,8 +65,12 @@ fn run_in_chroot_with_env(
         return Err(anyhow!("fork failed: {}", std::io::Error::last_os_error()));
     }
     if pid == 0 {
-        // Child — chroot and exec (capabilities are inherited across fork)
+        // Child — become root (we have CAP_SETUID/CAP_SETGID), chroot, exec
         unsafe {
+            // Become root so the chroot'd process can write to root-owned files
+            libc::setgid(0);
+            libc::setuid(0);
+
             if libc::chroot(rootfs_c.as_ptr()) != 0 {
                 libc::_exit(127);
             }
