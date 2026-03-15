@@ -807,7 +807,7 @@ fn start_network_dns(network_name: &str, info: &NetworkInfo) -> Result<()> {
     let pid_file = network_dir.join("dnsmasq.pid");
     let hosts_file = network_dir.join("dnsmasq.hosts");
 
-    // Check if already running
+    // Check if already running (by PID file or by checking if port is in use)
     if pid_file.exists() {
         if let Ok(pid_str) = fs::read_to_string(&pid_file) {
             if let Ok(pid) = pid_str.trim().parse::<i32>() {
@@ -816,9 +816,17 @@ fn start_network_dns(network_name: &str, info: &NetworkInfo) -> Result<()> {
                 }
             }
         }
-        // Stale pid file
         fs::remove_file(&pid_file).ok();
     }
+
+    // Also check if something is already listening on gateway:53
+    // (dnsmasq may be running without PID file due to permission drop)
+    let check = std::net::UdpSocket::bind(format!("{}:53", info.gateway));
+    if check.is_err() {
+        log::info!("DNS already listening on {}:53", info.gateway);
+        return Ok(()); // Something already serving DNS on this IP
+    }
+    drop(check);
 
     // Write initial hosts file
     let mut hosts = String::new();
