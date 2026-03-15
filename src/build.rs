@@ -8,6 +8,47 @@ use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use std::path::Path;
 
+/// Run a command inside a chroot using syscalls (not the chroot binary).
+///
+/// The `chroot` binary doesn't inherit Linux capabilities from our process,
+/// so we fork, call `nix::unistd::chroot()` (which uses our CAP_SYS_CHROOT),
+/// then exec the command.
+fn run_in_chroot(rootfs: &Path, cmd: &str, args: &[&str]) -> Result<std::process::ExitStatus> {
+    run_in_chroot_with_env(rootfs, cmd, args, &[])
+}
+
+fn run_in_chroot_with_env(
+    rootfs: &Path,
+    cmd: &str,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> Result<std::process::ExitStatus> {
+    use std::os::unix::process::CommandExt;
+
+    let rootfs = rootfs.to_path_buf();
+    let cmd = cmd.to_string();
+    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    let env: Vec<(String, String)> = env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+
+    // Use pre_exec to chroot before exec — this runs after fork but before exec
+    let mut command = std::process::Command::new(&cmd);
+    command.args(&args);
+    for (k, v) in &env {
+        command.env(k, v);
+    }
+    unsafe {
+        let rootfs = rootfs.clone();
+        command.pre_exec(move || {
+            nix::unistd::chroot(&rootfs)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("chroot failed: {e}")))?;
+            nix::unistd::chdir("/")
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("chdir failed: {e}")))?;
+            Ok(())
+        });
+    }
+    command.status().with_context(|| format!("failed to run {cmd} in chroot"))
+}
+
 /// Top-level Corten.toml structure.
 #[derive(Debug, Deserialize)]
 pub struct BuildConfig {
@@ -424,48 +465,40 @@ fn bootstrap_dnf(version: &str, rootfs: &Path) -> Result<()> {
 
 /// Install packages into the rootfs using the appropriate package manager.
 fn install_packages(system: &str, rootfs: &Path, packages: &[String]) -> Result<()> {
-    let rootfs_str = rootfs.to_string_lossy();
+    let pkg_refs: Vec<&str> = packages.iter().map(|s| s.as_str()).collect();
 
     match detect_package_manager(system) {
         "apk" => {
-            // Alpine: apk add --root <rootfs>
-            let mut cmd = std::process::Command::new("chroot");
-            cmd.arg(&*rootfs_str);
-            cmd.args(["apk", "add", "--no-cache"]);
-            cmd.args(packages);
-            let status = cmd.status().context("failed to run apk in chroot")?;
+            let mut args = vec!["apk", "add", "--no-cache"];
+            args.extend(&pkg_refs);
+            let status = run_in_chroot(rootfs, "apk", &args[1..])?;
             if !status.success() {
                 return Err(anyhow!("apk add failed"));
             }
         }
         "apt" => {
-            // Ubuntu/Debian: chroot + apt-get
-            let status = std::process::Command::new("chroot")
-                .arg(&*rootfs_str)
-                .args(["apt-get", "update", "-qq"])
-                .env("DEBIAN_FRONTEND", "noninteractive")
-                .status()
-                .context("failed to run apt-get update")?;
+            let status = run_in_chroot_with_env(
+                rootfs, "apt-get", &["update", "-qq"],
+                &[("DEBIAN_FRONTEND", "noninteractive")],
+            )?;
             if !status.success() {
                 log::warn!("apt-get update failed (may still work)");
             }
 
-            let mut cmd = std::process::Command::new("chroot");
-            cmd.arg(&*rootfs_str);
-            cmd.args(["apt-get", "install", "-y", "-qq"]);
-            cmd.env("DEBIAN_FRONTEND", "noninteractive");
-            cmd.args(packages);
-            let status = cmd.status().context("failed to run apt-get install")?;
+            let mut args = vec!["install", "-y", "-qq"];
+            args.extend(&pkg_refs);
+            let status = run_in_chroot_with_env(
+                rootfs, "apt-get", &args,
+                &[("DEBIAN_FRONTEND", "noninteractive")],
+            )?;
             if !status.success() {
                 return Err(anyhow!("apt-get install failed"));
             }
         }
         "dnf" => {
-            let mut cmd = std::process::Command::new("chroot");
-            cmd.arg(&*rootfs_str);
-            cmd.args(["dnf", "install", "-y"]);
-            cmd.args(packages);
-            let status = cmd.status().context("failed to run dnf install")?;
+            let mut args = vec!["install", "-y"];
+            args.extend(&pkg_refs);
+            let status = run_in_chroot(rootfs, "dnf", &args)?;
             if !status.success() {
                 return Err(anyhow!("dnf install failed"));
             }
@@ -506,11 +539,7 @@ fn copy_files(toml_dir: &Path, rootfs: &Path, files: &[FileCopy]) -> Result<()> 
 
         // Set owner if specified (best-effort)
         if let Some(owner) = &f.owner {
-            std::process::Command::new("chroot")
-                .arg(&rootfs.to_string_lossy().to_string())
-                .args(["chown", "-R", owner, &f.dest])
-                .status()
-                .ok();
+            run_in_chroot(rootfs, "chown", &["-R", owner, &f.dest]).ok();
         }
 
         println!("    {} -> {}", f.src, f.dest);
@@ -537,15 +566,9 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
 
 /// Run setup commands in chroot.
 fn run_setup_commands(rootfs: &Path, commands: &[String]) -> Result<()> {
-    let rootfs_str = rootfs.to_string_lossy();
-
     for cmd_str in commands {
         println!("    $ {cmd_str}");
-        let status = std::process::Command::new("chroot")
-            .arg(&*rootfs_str)
-            .args(["sh", "-c", cmd_str])
-            .status()
-            .with_context(|| format!("failed to run: {cmd_str}"))?;
+        let status = run_in_chroot(rootfs, "sh", &["-c", cmd_str])?;
 
         if !status.success() {
             return Err(anyhow!("setup command failed: {cmd_str}"));
@@ -557,22 +580,12 @@ fn run_setup_commands(rootfs: &Path, commands: &[String]) -> Result<()> {
 
 /// Clean package manager caches to reduce image size.
 fn clean_package_cache(system: &str, rootfs: &Path) {
-    let rootfs_str = rootfs.to_string_lossy();
-
     match detect_package_manager(system) {
         "apk" => {
-            std::process::Command::new("chroot")
-                .arg(&*rootfs_str)
-                .args(["rm", "-rf", "/var/cache/apk/*"])
-                .status()
-                .ok();
+            run_in_chroot(rootfs, "rm", &["-rf", "/var/cache/apk/*"]).ok();
         }
         "apt" => {
-            std::process::Command::new("chroot")
-                .arg(&*rootfs_str)
-                .args(["apt-get", "clean"])
-                .status()
-                .ok();
+            run_in_chroot(rootfs, "apt-get", &["clean"]).ok();
             // Remove apt lists
             let lists = rootfs.join("var/lib/apt/lists");
             if lists.exists() {
@@ -581,11 +594,7 @@ fn clean_package_cache(system: &str, rootfs: &Path) {
             }
         }
         "dnf" => {
-            std::process::Command::new("chroot")
-                .arg(&*rootfs_str)
-                .args(["dnf", "clean", "all"])
-                .status()
-                .ok();
+            run_in_chroot(rootfs, "dnf", &["clean", "all"]).ok();
         }
         _ => {}
     }
