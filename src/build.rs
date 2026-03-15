@@ -23,13 +23,9 @@ fn run_in_chroot_with_env(
     args: &[&str],
     env: &[(&str, &str)],
 ) -> Result<std::process::ExitStatus> {
-    use std::os::unix::process::CommandExt;
+    use std::ffi::CString;
 
-    let rootfs = rootfs.to_path_buf();
-
-    // Build the full shell command to run inside chroot.
-    // We exec /bin/sh because Command::new() resolves the binary on the HOST
-    // before pre_exec runs. /bin/sh is guaranteed to exist in the rootfs.
+    // Build argv for execvp
     let shell_cmd = if args.is_empty() {
         cmd.to_string()
     } else {
@@ -43,23 +39,57 @@ fn run_in_chroot_with_env(
         format!("{cmd} {}", escaped_args.join(" "))
     };
 
-    let mut command = std::process::Command::new("/bin/sh");
-    command.arg("-c").arg(&shell_cmd);
-    command.env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+    // Build envp
+    let mut env_vec: Vec<String> = vec![
+        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
+        "HOME=/root".to_string(),
+    ];
     for (k, v) in env {
-        command.env(k, v);
+        env_vec.push(format!("{k}={v}"));
     }
-    unsafe {
-        let rootfs = rootfs.clone();
-        command.pre_exec(move || {
-            nix::unistd::chroot(&rootfs)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("chroot failed: {e}")))?;
-            nix::unistd::chdir("/")
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("chdir failed: {e}")))?;
-            Ok(())
-        });
+
+    let c_sh = CString::new("/bin/sh").unwrap();
+    let c_flag = CString::new("-c").unwrap();
+    let c_cmd = CString::new(shell_cmd.as_str()).unwrap();
+    let c_argv = [c_sh.as_ptr(), c_flag.as_ptr(), c_cmd.as_ptr(), std::ptr::null()];
+    let c_env: Vec<CString> = env_vec.iter().map(|e| CString::new(e.as_str()).unwrap()).collect();
+    let c_envp: Vec<*const libc::c_char> = c_env.iter().map(|e| e.as_ptr()).chain(std::iter::once(std::ptr::null())).collect();
+
+    let rootfs_c = CString::new(rootfs.to_string_lossy().as_bytes())
+        .context("invalid rootfs path")?;
+    let root_c = CString::new("/").unwrap();
+
+    // Fork, chroot (with our capabilities), exec
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(anyhow!("fork failed: {}", std::io::Error::last_os_error()));
     }
-    command.status().with_context(|| format!("failed to run '{shell_cmd}' in chroot"))
+    if pid == 0 {
+        // Child — chroot and exec (capabilities are inherited across fork)
+        unsafe {
+            if libc::chroot(rootfs_c.as_ptr()) != 0 {
+                libc::_exit(127);
+            }
+            if libc::chdir(root_c.as_ptr()) != 0 {
+                libc::_exit(127);
+            }
+            libc::execve(c_sh.as_ptr(), c_argv.as_ptr(), c_envp.as_ptr());
+            libc::_exit(127); // exec failed
+        }
+    }
+
+    // Parent — wait for child
+    let mut status: libc::c_int = 0;
+    unsafe { libc::waitpid(pid, &mut status, 0) };
+
+    if libc::WIFEXITED(status) {
+        let code = libc::WEXITSTATUS(status);
+        // ExitStatus can't be constructed directly; use from_raw on the wait status
+        use std::os::unix::process::ExitStatusExt;
+        Ok(std::process::ExitStatus::from_raw(status))
+    } else {
+        Err(anyhow!("chroot command terminated abnormally"))
+    }
 }
 
 /// Top-level Corten.toml structure.
@@ -482,9 +512,9 @@ fn install_packages(system: &str, rootfs: &Path, packages: &[String]) -> Result<
 
     match detect_package_manager(system) {
         "apk" => {
-            let mut args = vec!["apk", "add", "--no-cache"];
+            let mut args = vec!["add", "--no-cache"];
             args.extend(&pkg_refs);
-            let status = run_in_chroot(rootfs, "apk", &args[1..])?;
+            let status = run_in_chroot(rootfs, "apk", &args)?;
             if !status.success() {
                 return Err(anyhow!("apk add failed"));
             }
