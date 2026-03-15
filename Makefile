@@ -46,7 +46,7 @@ install: build
 	sudo install -m 755 $(TARGET) $(PREFIX)/bin/$(BINARY)
 	@echo ""
 	@echo "2. Setting Linux capabilities (replaces need for sudo)..."
-	sudo setcap 'cap_sys_admin,cap_net_admin,cap_sys_chroot,cap_dac_override,cap_fowner,cap_setuid,cap_setgid,cap_mknod+eip' $(PREFIX)/bin/$(BINARY)
+	sudo setcap 'cap_sys_admin,cap_net_admin,cap_sys_chroot,cap_dac_override,cap_fowner,cap_chown,cap_setuid,cap_setgid,cap_mknod+eip' $(PREFIX)/bin/$(BINARY)
 	@echo ""
 	@echo "3. Creating data directories..."
 	sudo mkdir -p /var/lib/corten/images /var/lib/corten/containers
