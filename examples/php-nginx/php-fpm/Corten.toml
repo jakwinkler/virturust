@@ -1,0 +1,28 @@
+# PHP-FPM container
+#
+# Runs PHP FastCGI Process Manager on port 9000.
+# Nginx connects to this via FastCGI protocol.
+
+[image]
+name = "stack-php"
+tag = "latest"
+
+[base]
+system = "alpine"
+version = "3.20"
+
+[packages]
+install = ["php83", "php83-fpm", "php83-json", "php83-mbstring", "php83-session"]
+
+[setup]
+run = [
+    "mkdir -p /var/www/html /run/php",
+    # Configure php-fpm to listen on all interfaces (not just socket)
+    "sed -i 's|listen = 127.0.0.1:9000|listen = 0.0.0.0:9000|' /etc/php83/php-fpm.d/www.conf",
+    # Create a PHP app
+    "printf '<?php\\necho \"<h1>Hello from Corten!</h1>\";\\necho \"<p>PHP \" . phpversion() . \" running on \" . php_uname() . \"</p>\";\\necho \"<p>Server: \" . $_SERVER[\"SERVER_SOFTWARE\"] . \"</p>\";\\necho \"<p>Time: \" . date(\"Y-m-d H:i:s\") . \"</p>\";\\n' > /var/www/html/index.php",
+    "printf '<?php phpinfo();' > /var/www/html/info.php",
+]
+
+[container]
+command = ["/usr/sbin/php-fpm83", "--nodaemonize", "--fpm-config", "/etc/php83/php-fpm.conf"]
