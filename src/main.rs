@@ -21,9 +21,14 @@ async fn main() -> Result<()> {
     // Elevate to root if we have CAP_SETUID (from make install).
     // This allows all child processes (ip, iptables, nsenter, chroot)
     // and netlink operations to work without sudo.
+    // Use setresuid/setresgid to set real, effective, and saved UIDs.
     unsafe {
-        libc::setegid(0);
-        libc::seteuid(0);
+        let r1 = libc::setresgid(0, 0, 0);
+        let r2 = libc::setresuid(0, 0, 0);
+        if r1 != 0 || r2 != 0 {
+            // Not fatal — we might be running without capabilities (dev mode)
+            log::debug!("setresuid(0) failed — running without root elevation");
+        }
     }
 
     // Configure logging — default to "info", use "debug" with --verbose
