@@ -842,7 +842,25 @@ fn start_network_dns(network_name: &str, info: &NetworkInfo) -> Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        log::warn!("dnsmasq failed to start: {stderr}");
+        log::warn!("dnsmasq failed to start on {}: {stderr}", info.gateway);
+        // Fallback: try with --user=root in case of permission issues
+        let output2 = root_cmd("dnsmasq")
+            .args([
+                "--user=root",
+                "--no-resolv",
+                "--no-hosts",
+                "--bind-interfaces",
+                &format!("--listen-address={}", info.gateway),
+                &format!("--addn-hosts={}", hosts_file.display()),
+                &format!("--pid-file={}", pid_file.display()),
+            ])
+            .output();
+        if let Ok(o) = output2 {
+            if !o.status.success() {
+                let stderr2 = String::from_utf8_lossy(&o.stderr);
+                log::warn!("dnsmasq fallback also failed: {stderr2}");
+            }
+        }
     }
 
     log::info!("started dnsmasq for network '{network_name}' on {}", info.gateway);
