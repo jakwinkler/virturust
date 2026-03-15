@@ -222,6 +222,27 @@ pub fn run(config: &ContainerConfig, detach: bool) -> Result<i32> {
     let mut restart_count = 0u32;
     let final_exit_code;
 
+    // In detach mode, fork BEFORE clone so the monitor is the parent of the container.
+    // waitpid only works on direct children.
+    if detach {
+        let monitor_pid = unsafe { libc::fork() };
+        if monitor_pid < 0 {
+            return Err(anyhow!("fork failed: {}", std::io::Error::last_os_error()));
+        }
+        if monitor_pid > 0 {
+            // Original process — print container ID and return immediately
+            println!("{}", config.id);
+            return Ok(0);
+        }
+        // Monitor process — detach from terminal
+        unsafe {
+            libc::setsid();
+            libc::close(0);
+            libc::close(1);
+            libc::close(2);
+        }
+    }
+
     loop {
         // Create sync pipe for parent-child coordination
         let mut fds = [0i32; 2];
@@ -349,30 +370,6 @@ pub fn run(config: &ContainerConfig, detach: bool) -> Result<i32> {
 
         if restart_count == 0 {
             println!("Container '{}' started (PID {})", config.name, child_pid);
-        }
-
-        // In detach mode, fork a monitor process and return immediately.
-        // The monitor keeps the container child alive and cleans up when it exits.
-        if detach {
-            let monitor_pid = unsafe { libc::fork() };
-            if monitor_pid < 0 {
-                return Err(anyhow!("fork failed: {}", std::io::Error::last_os_error()));
-            }
-            if monitor_pid > 0 {
-                // Original process — return to user immediately
-                println!("{}", config.id);
-                return Ok(0);
-            }
-            // Monitor process — detach from terminal, wait for child, cleanup
-            unsafe {
-                libc::setsid(); // new session, detach from terminal
-            }
-            // Close stdin/stdout/stderr so we don't hold the terminal
-            unsafe {
-                libc::close(0);
-                libc::close(1);
-                libc::close(2);
-            }
         }
 
         // Wait for the container process to exit (foreground or monitor)
