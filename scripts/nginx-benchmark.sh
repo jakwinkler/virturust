@@ -104,7 +104,7 @@ run = [
 ]
 
 [container]
-command = ["sh", "-c", "mkdir -p /run/nginx && nginx -g 'daemon off;'"]
+command = ["/bin/sh", "-c", "mkdir -p /run/nginx && exec nginx -g 'daemon off;'"]
 TOML
 
 START=$(date +%s%N)

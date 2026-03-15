@@ -210,14 +210,12 @@ fn child_main(args: &ChildArgs) -> Result<()> {
         .chain(std::iter::once(std::ptr::null()))
         .collect();
 
-    // Set up environment for exec — ensure PATH includes standard dirs
+    // Set PATH in current process so execvpe can find binaries
+    // (execvpe uses the caller's PATH for resolution, not the envp argument)
+    unsafe {
+        std::env::set_var("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+    }
     let mut env_map: std::collections::HashMap<String, String> = std::env::vars().collect();
-    env_map.entry("PATH".to_string()).or_insert_with(||
-        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()
-    );
-    // Override PATH to always include /bin and /sbin (container rootfs)
-    env_map.insert("PATH".to_string(),
-        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string());
     let c_env: Vec<CString> = env_map.iter()
         .map(|(k, v)| CString::new(format!("{k}={v}")).expect("invalid env var"))
         .collect();
