@@ -309,6 +309,7 @@ pub fn setup_container_network(container_id: &str, child_pid: i32) -> Result<Con
         }
 
         // 1. Create veth pair
+        log::debug!("creating veth pair {veth_host} <-> {veth_peer}");
         handle
             .link()
             .add()
@@ -316,6 +317,7 @@ pub fn setup_container_network(container_id: &str, child_pid: i32) -> Result<Con
             .execute()
             .await
             .context("failed to create veth pair")?;
+        log::debug!("veth pair created");
 
         // 2. Get bridge index
         let mut links = handle.link().get().match_name(BRIDGE_NAME.to_string()).execute();
@@ -349,6 +351,7 @@ pub fn setup_container_network(container_id: &str, child_pid: i32) -> Result<Con
             .context("failed to bring up host veth")?;
 
         // 4. Get peer veth index and move to container netns
+        log::debug!("looking up peer veth {veth_peer}");
         let mut links = handle.link().get().match_name(veth_peer.clone()).execute();
         let peer_veth = links
             .try_next()
@@ -356,6 +359,7 @@ pub fn setup_container_network(container_id: &str, child_pid: i32) -> Result<Con
             .ok_or_else(|| anyhow!("peer veth not found"))?;
         let peer_veth_idx = peer_veth.header.index;
 
+        log::debug!("moving peer veth idx={peer_veth_idx} to PID {child_pid}");
         handle
             .link()
             .set(peer_veth_idx)
@@ -363,6 +367,7 @@ pub fn setup_container_network(container_id: &str, child_pid: i32) -> Result<Con
             .execute()
             .await
             .context("failed to move veth to container netns")?;
+        log::debug!("veth moved successfully");
 
         Ok::<_, anyhow::Error>(())
     })?;
