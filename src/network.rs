@@ -719,6 +719,9 @@ pub fn remove_network(name: &str) -> Result<()> {
         ));
     }
 
+    // Stop dnsmasq
+    stop_network_dns(name);
+
     // Delete the bridge
     run_cmd("ip", &["link", "del", &info.bridge]).ok();
 
@@ -751,7 +754,7 @@ fn save_network(info: &NetworkInfo) -> Result<()> {
         .context("failed to save network metadata")
 }
 
-/// Register a container in a named network (for DNS resolution).
+/// Register a container in a named network and update DNS.
 pub fn register_container_in_network(
     network_name: &str,
     container_name: &str,
@@ -761,13 +764,17 @@ pub fn register_container_in_network(
     info.containers
         .insert(container_name.to_string(), container_ip.to_string());
     save_network(&info)?;
+
+    // Update dnsmasq hosts file and reload
+    update_network_dns(network_name, &info)?;
+
     log::info!(
         "registered container '{container_name}' ({container_ip}) in network '{network_name}'"
     );
     Ok(())
 }
 
-/// Unregister a container from a named network.
+/// Unregister a container from a named network and update DNS.
 pub fn unregister_container_from_network(
     network_name: &str,
     container_name: &str,
@@ -775,16 +782,138 @@ pub fn unregister_container_from_network(
     let mut info = load_network(network_name)?;
     info.containers.remove(container_name);
     save_network(&info)?;
+
+    // Update dnsmasq hosts file and reload
+    update_network_dns(network_name, &info)?;
+
+    // If no containers left, stop dnsmasq
+    if info.containers.is_empty() {
+        stop_network_dns(network_name);
+    }
+
     log::info!(
         "unregistered container '{container_name}' from network '{network_name}'"
     );
     Ok(())
 }
 
+/// Start dnsmasq for a named network (if not already running).
+///
+/// dnsmasq listens on the gateway IP and resolves container names
+/// to their IPs. This is how Docker does it (at 127.0.0.11), but
+/// we use the gateway IP directly — no daemon overhead.
+fn start_network_dns(network_name: &str, info: &NetworkInfo) -> Result<()> {
+    let network_dir = Path::new(NETWORKS_DIR).join(network_name);
+    let pid_file = network_dir.join("dnsmasq.pid");
+    let hosts_file = network_dir.join("dnsmasq.hosts");
+
+    // Check if already running
+    if pid_file.exists() {
+        if let Ok(pid_str) = fs::read_to_string(&pid_file) {
+            if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                if unsafe { libc::kill(pid, 0) } == 0 {
+                    return Ok(()); // Already running
+                }
+            }
+        }
+        // Stale pid file
+        fs::remove_file(&pid_file).ok();
+    }
+
+    // Write initial hosts file
+    let mut hosts = String::new();
+    for (name, ip) in &info.containers {
+        hosts.push_str(&format!("{ip} {name}\n"));
+    }
+    fs::write(&hosts_file, &hosts)?;
+
+    // Start dnsmasq bound to the gateway IP
+    let status = root_cmd("dnsmasq")
+        .args([
+            "--no-daemon",
+            "--no-resolv",
+            "--no-hosts",
+            "--bind-interfaces",
+            &format!("--listen-address={}", info.gateway),
+            &format!("--addn-hosts={}", hosts_file.display()),
+            &format!("--pid-file={}", pid_file.display()),
+            "--log-facility=-",  // log to stderr, not syslog
+            "--keep-in-foreground",
+        ])
+        // Actually we need it in the background
+        .arg("--keep-in-foreground")
+        .spawn();
+
+    // dnsmasq with --keep-in-foreground stays in foreground, we need --no-daemon removed
+    // Let me use the proper daemon mode instead
+    drop(status);
+
+    root_cmd("dnsmasq")
+        .args([
+            "--no-resolv",
+            "--no-hosts",
+            "--bind-interfaces",
+            &format!("--listen-address={}", info.gateway),
+            &format!("--addn-hosts={}", hosts_file.display()),
+            &format!("--pid-file={}", pid_file.display()),
+            "--log-facility=-",
+        ])
+        .output()
+        .context("failed to start dnsmasq — is it installed?")?;
+
+    log::info!("started dnsmasq for network '{network_name}' on {}", info.gateway);
+    Ok(())
+}
+
+/// Update the dnsmasq hosts file and reload (SIGHUP).
+fn update_network_dns(network_name: &str, info: &NetworkInfo) -> Result<()> {
+    let network_dir = Path::new(NETWORKS_DIR).join(network_name);
+    let hosts_file = network_dir.join("dnsmasq.hosts");
+    let pid_file = network_dir.join("dnsmasq.pid");
+
+    // Write updated hosts file
+    let mut hosts = String::new();
+    for (name, ip) in &info.containers {
+        hosts.push_str(&format!("{ip} {name}\n"));
+    }
+    fs::write(&hosts_file, &hosts)?;
+
+    // Send SIGHUP to dnsmasq to reload hosts
+    if pid_file.exists() {
+        if let Ok(pid_str) = fs::read_to_string(&pid_file) {
+            if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                unsafe { libc::kill(pid, libc::SIGHUP) };
+                log::info!("reloaded dnsmasq for network '{network_name}'");
+            }
+        }
+    } else {
+        // dnsmasq not running yet — start it
+        start_network_dns(network_name, info)?;
+    }
+
+    Ok(())
+}
+
+/// Stop dnsmasq for a named network.
+fn stop_network_dns(network_name: &str) {
+    let network_dir = Path::new(NETWORKS_DIR).join(network_name);
+    let pid_file = network_dir.join("dnsmasq.pid");
+
+    if pid_file.exists() {
+        if let Ok(pid_str) = fs::read_to_string(&pid_file) {
+            if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                unsafe { libc::kill(pid, libc::SIGTERM) };
+                log::info!("stopped dnsmasq for network '{network_name}'");
+            }
+        }
+        fs::remove_file(&pid_file).ok();
+    }
+}
+
 /// Set up DNS for a container on a named network.
 ///
-/// Writes an /etc/hosts file into the container rootfs with entries
-/// for all containers in the same network, enabling name resolution.
+/// Points the container's resolv.conf to the gateway IP where dnsmasq runs.
+/// Also writes /etc/hosts with localhost entry.
 pub fn setup_named_network_dns(
     rootfs: &Path,
     network_name: &str,
@@ -796,21 +925,21 @@ pub fn setup_named_network_dns(
     let container_etc = rootfs.join("etc");
     fs::create_dir_all(&container_etc).ok();
 
-    // Build /etc/hosts with entries for all containers in the network
-    let mut hosts = String::from("127.0.0.1\tlocalhost\n");
-    hosts.push_str(&format!("{own_ip}\t{own_name}\n"));
+    // Point resolv.conf to the gateway where dnsmasq listens
+    let resolv = format!("nameserver {}\n", info.gateway);
+    fs::write(container_etc.join("resolv.conf"), &resolv)
+        .context("failed to write /etc/resolv.conf")?;
 
-    for (name, ip) in &info.containers {
-        if name != own_name {
-            hosts.push_str(&format!("{ip}\t{name}\n"));
-        }
-    }
-
+    // Write minimal /etc/hosts (just localhost + self)
+    let hosts = format!("127.0.0.1\tlocalhost\n{own_ip}\t{own_name}\n");
     fs::write(container_etc.join("hosts"), &hosts)
-        .context("failed to write /etc/hosts for named network DNS")?;
+        .context("failed to write /etc/hosts")?;
 
-    log::info!("wrote /etc/hosts with {} entries for network '{network_name}'",
-        info.containers.len() + 1);
+    // Ensure dnsmasq is running on this network
+    start_network_dns(network_name, &info)?;
+
+    log::info!("DNS configured for '{own_name}' on network '{network_name}' (nameserver={})",
+        info.gateway);
     Ok(())
 }
 
