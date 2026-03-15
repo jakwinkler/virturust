@@ -656,7 +656,35 @@ pub fn create_network(name: &str) -> Result<NetworkInfo> {
         "iptables",
         &["-t", "nat", "-A", "POSTROUTING", "-s", &subnet, "-j", "MASQUERADE"],
     )
-    .ok(); // Best-effort
+    .ok();
+
+    // Start dnsmasq for this network immediately (before any containers join)
+    // Write an empty hosts file first
+    let hosts_file = network_dir.join("dnsmasq.hosts");
+    fs::write(&hosts_file, "").ok();
+    let pid_file = network_dir.join("dnsmasq.pid");
+
+    let dns_output = root_cmd("dnsmasq")
+        .args([
+            "--conf-file=/dev/null",
+            "--no-resolv",
+            "--no-hosts",
+            "--bind-dynamic",
+            &format!("--listen-address={}", gateway),
+            &format!("--addn-hosts={}", hosts_file.display()),
+            &format!("--pid-file={}", pid_file.display()),
+        ])
+        .output();
+    match dns_output {
+        Ok(o) if o.status.success() => {
+            log::info!("started dnsmasq for network '{name}' on {gateway}");
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            log::warn!("dnsmasq failed for network '{name}': {stderr}");
+        }
+        Err(e) => log::warn!("dnsmasq exec failed: {e}"),
+    }
 
     let info = NetworkInfo {
         name: name.to_string(),
