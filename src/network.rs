@@ -827,28 +827,8 @@ fn start_network_dns(network_name: &str, info: &NetworkInfo) -> Result<()> {
     }
     fs::write(&hosts_file, &hosts)?;
 
-    // Start dnsmasq bound to the gateway IP
-    let status = root_cmd("dnsmasq")
-        .args([
-            "--no-daemon",
-            "--no-resolv",
-            "--no-hosts",
-            "--bind-interfaces",
-            &format!("--listen-address={}", info.gateway),
-            &format!("--addn-hosts={}", hosts_file.display()),
-            &format!("--pid-file={}", pid_file.display()),
-            "--log-facility=-",  // log to stderr, not syslog
-            "--keep-in-foreground",
-        ])
-        // Actually we need it in the background
-        .arg("--keep-in-foreground")
-        .spawn();
-
-    // dnsmasq with --keep-in-foreground stays in foreground, we need --no-daemon removed
-    // Let me use the proper daemon mode instead
-    drop(status);
-
-    root_cmd("dnsmasq")
+    // Start dnsmasq in daemon mode (forks to background, writes PID file)
+    let output = root_cmd("dnsmasq")
         .args([
             "--no-resolv",
             "--no-hosts",
@@ -856,10 +836,14 @@ fn start_network_dns(network_name: &str, info: &NetworkInfo) -> Result<()> {
             &format!("--listen-address={}", info.gateway),
             &format!("--addn-hosts={}", hosts_file.display()),
             &format!("--pid-file={}", pid_file.display()),
-            "--log-facility=-",
         ])
         .output()
         .context("failed to start dnsmasq — is it installed?")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        log::warn!("dnsmasq failed to start: {stderr}");
+    }
 
     log::info!("started dnsmasq for network '{network_name}' on {}", info.gateway);
     Ok(())
@@ -953,21 +937,28 @@ pub fn setup_container_named_network(
 
     let short_id = &container_id[..8];
     let veth_host = format!("veth-{short_id}");
-    let veth_container = "eth0";
+    let veth_peer = format!("peer-{short_id}");
 
-    // Create veth pair
+    // Clean up stale veth
+    run_cmd("ip", &["link", "del", &veth_host]).ok();
+
+    // Create veth pair with unique names
     run_cmd(
         "ip",
-        &["link", "add", &veth_host, "type", "veth", "peer", "name", veth_container],
+        &["link", "add", &veth_host, "type", "veth", "peer", "name", &veth_peer],
     )?;
 
     // Attach to the named network's bridge
     run_cmd("ip", &["link", "set", &veth_host, "master", &info.bridge])?;
     run_cmd("ip", &["link", "set", &veth_host, "up"])?;
 
-    // Move container side into netns
+    // Move peer into container netns
     let pid_str = child_pid.to_string();
-    run_cmd("ip", &["link", "set", veth_container, "netns", &pid_str])?;
+    run_cmd("ip", &["link", "set", &veth_peer, "netns", &pid_str])?;
+
+    // Rename to eth0 inside container
+    let net_ns = format!("--net=/proc/{child_pid}/ns/net");
+    run_cmd("nsenter", &[&net_ns, "ip", "link", "set", &veth_peer, "name", "eth0"])?;
 
     // Allocate IP from the named network's subnet
     let third_octet: u8 = info.gateway.split('.').nth(2)
@@ -989,11 +980,10 @@ pub fn setup_container_named_network(
     let ip_cidr = format!("{ip}/24");
     fs::write(&next_ip_file, (next_octet + 1).to_string())?;
 
-    // Configure container side
-    let ns_path = format!("/proc/{child_pid}/ns/net");
-    run_cmd("nsenter", &["--net", &ns_path, "ip", "addr", "add", &ip_cidr, "dev", veth_container])?;
-    run_cmd("nsenter", &["--net", &ns_path, "ip", "link", "set", veth_container, "up"])?;
-    run_cmd("nsenter", &["--net", &ns_path, "ip", "route", "add", "default", "via", &info.gateway])?;
+    // Configure eth0 inside the container namespace
+    run_cmd("nsenter", &[&net_ns, "ip", "addr", "add", &ip_cidr, "dev", "eth0"])?;
+    run_cmd("nsenter", &[&net_ns, "ip", "link", "set", "eth0", "up"])?;
+    run_cmd("nsenter", &[&net_ns, "ip", "route", "add", "default", "via", &info.gateway])?;
 
     log::info!(
         "container {short_id}: connected to network '{network_name}' (IP={ip}, bridge={})",
