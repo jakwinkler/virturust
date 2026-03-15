@@ -12,17 +12,9 @@
 //! - NAT/masquerade for outbound connectivity
 //! - DNS forwarding (host resolv.conf copied into container)
 //! - IP allocation via file-based allocator
-//!
-//! ## Implementation
-//!
-//! Uses rtnetlink (netlink) for all `ip` operations instead of forking
-//! external processes. Uses nix::sched::setns() instead of `nsenter`.
-//! Only iptables/nftables still use Command (netfilter crates are immature).
 
 use anyhow::{anyhow, Context, Result};
-use futures::TryStreamExt;
 use std::fs;
-use std::os::unix::io::AsFd;
 use std::path::Path;
 use std::process::Command;
 
@@ -54,40 +46,22 @@ pub struct ContainerNetwork {
     pub veth_host: String,
 }
 
-/// Run an async block on a fresh tokio runtime in a dedicated thread.
-/// Avoids "cannot block_on inside runtime" when called from #[tokio::main].
-macro_rules! netlink_block {
-    ($body:expr) => {{
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .context("failed to create netlink runtime")?;
-                rt.block_on($body)
-            })
-            .join()
-            .map_err(|_| anyhow!("netlink thread panicked"))?
-        })
-    }};
-}
-
 /// Bring up the loopback interface inside the container's network namespace.
 ///
 /// Without this, even `localhost` / `127.0.0.1` won't work inside the
 /// container. The loopback interface exists in every network namespace
 /// by default, but starts in the DOWN state.
 pub fn setup_loopback() -> Result<()> {
-    netlink_block!(async move {
-        let (connection, handle, _) = rtnetlink::new_connection()?;
-        tokio::spawn(connection);
+    let output = Command::new("ip")
+        .args(["link", "set", "lo", "up"])
+        .output()
+        .context("failed to run 'ip link set lo up' — is iproute2 installed?")?;
 
-        let mut links = handle.link().get().match_name("lo".to_string()).execute();
-        if let Some(link) = links.try_next().await? {
-            handle.link().set(link.header.index).up().execute().await?;
-        }
-        Ok::<_, anyhow::Error>(())
-    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        log::warn!("failed to bring up loopback: {stderr}");
+    }
+
     Ok(())
 }
 
@@ -96,84 +70,76 @@ pub fn setup_loopback() -> Result<()> {
 /// Creates the bridge if it doesn't already exist, assigns 10.0.42.1/24,
 /// brings it up, and enables IP forwarding on the host.
 pub fn ensure_bridge() -> Result<()> {
-    netlink_block!(async move {
-        let (connection, handle, _) = rtnetlink::new_connection()?;
-        tokio::spawn(connection);
+    // Check if bridge already exists
+    let output = Command::new("ip")
+        .args(["link", "show", BRIDGE_NAME])
+        .output()
+        .context("failed to check for bridge interface")?;
 
-        // Check if bridge exists
-        let mut links = handle.link().get().match_name(BRIDGE_NAME.to_string()).execute();
-        let bridge_exists = links.try_next().await?.is_some();
+    if !output.status.success() {
+        // Bridge does not exist — create it
+        log::info!("creating bridge interface {BRIDGE_NAME}");
 
-        if !bridge_exists {
-            log::info!("creating bridge interface {BRIDGE_NAME}");
+        run_cmd("ip", &["link", "add", BRIDGE_NAME, "type", "bridge"])
+            .context("failed to create bridge interface")?;
 
-            // Create bridge
-            handle
-                .link()
-                .add()
-                .bridge(BRIDGE_NAME.to_string())
-                .execute()
-                .await
-                .context("failed to create bridge")?;
+        run_cmd("ip", &["addr", "add", BRIDGE_IP_CIDR, "dev", BRIDGE_NAME])
+            .context("failed to assign IP to bridge")?;
 
-            // Get bridge index
-            let mut links = handle.link().get().match_name(BRIDGE_NAME.to_string()).execute();
-            let bridge = links
-                .try_next()
-                .await?
-                .ok_or_else(|| anyhow!("bridge not found after creation"))?;
-            let bridge_idx = bridge.header.index;
+        run_cmd("ip", &["link", "set", BRIDGE_NAME, "up"])
+            .context("failed to bring up bridge")?;
 
-            // Add IP address
-            let addr: std::net::Ipv4Addr = BRIDGE_IP.parse()?;
-            handle
-                .address()
-                .add(bridge_idx, std::net::IpAddr::V4(addr), 24)
-                .execute()
-                .await
-                .context("failed to assign IP to bridge")?;
-
-            // Bring up
-            handle
-                .link()
-                .set(bridge_idx)
-                .up()
-                .execute()
-                .await
-                .context("failed to bring up bridge")?;
-
-            log::info!("bridge {BRIDGE_NAME} created with IP {BRIDGE_IP_CIDR}");
-        } else {
-            log::info!("bridge {BRIDGE_NAME} already exists");
-        }
-        Ok::<_, anyhow::Error>(())
-    })?;
+        log::info!("bridge {BRIDGE_NAME} created with IP {BRIDGE_IP_CIDR}");
+    } else {
+        log::info!("bridge {BRIDGE_NAME} already exists");
+    }
 
     // Enable IP forwarding
     fs::write("/proc/sys/net/ipv4/ip_forward", "1")
         .context("failed to enable IP forwarding")?;
     log::info!("IP forwarding enabled");
 
-    // Docker coexistence: add DOCKER-USER rules if Docker is running
-    if Command::new("iptables")
+    // On systems with firewalld (Fedora, RHEL, CentOS), add the bridge
+    // to the trusted zone so container traffic isn't blocked by the firewall.
+    if Command::new("firewall-cmd").arg("--state").output()
+        .map(|o| o.status.success()).unwrap_or(false)
+    {
+        run_cmd("firewall-cmd", &[
+            "--zone=trusted",
+            &format!("--add-interface={BRIDGE_NAME}"),
+        ]).ok();
+
+        run_cmd("firewall-cmd", &["--zone=trusted", "--add-masquerade"]).ok();
+
+        log::info!("added {BRIDGE_NAME} to firewalld trusted zone");
+    }
+
+    // If Docker is running, its FORWARD chain has policy DROP and routes
+    // everything through DOCKER-USER first. Insert our ACCEPT rules there
+    // so Corten bridge traffic isn't blocked by Docker's firewall.
+    let docker_user_exists = Command::new("iptables")
         .args(["-L", "DOCKER-USER", "-n"])
         .output()
         .map(|o| o.status.success())
-        .unwrap_or(false)
-    {
-        let already = Command::new("iptables")
+        .unwrap_or(false);
+
+    if docker_user_exists {
+        // Check if rules already exist before inserting
+        let already_has_rule = Command::new("iptables")
             .args(["-C", "DOCKER-USER", "-s", BRIDGE_SUBNET, "-j", "ACCEPT"])
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false);
-        if !already {
+
+        if !already_has_rule {
             run_cmd("iptables", &["-I", "DOCKER-USER", "-s", BRIDGE_SUBNET, "-j", "ACCEPT"]).ok();
             run_cmd("iptables", &["-I", "DOCKER-USER", "-d", BRIDGE_SUBNET, "-j", "ACCEPT"]).ok();
             log::info!("added ACCEPT rules to DOCKER-USER chain for {BRIDGE_SUBNET}");
         }
     }
 
-    // Disable bridge netfilter
+    // Disable bridge netfilter — prevents iptables/nftables from
+    // filtering traffic that's already on the bridge (local traffic).
     fs::write("/proc/sys/net/bridge/bridge-nf-call-iptables", "0").ok();
     fs::write("/proc/sys/net/bridge/bridge-nf-call-ip6tables", "0").ok();
 
@@ -182,10 +148,18 @@ pub fn ensure_bridge() -> Result<()> {
 
 /// Set up NAT (masquerade) rules for outbound container traffic.
 ///
-/// Adds iptables MASQUERADE + FORWARD rules directly.
-/// Falls back to nftables if iptables is unavailable.
+/// Tries firewalld first (Fedora/RHEL), then iptables, then nftables.
 pub fn setup_nat() -> Result<()> {
-    // Try iptables first
+    // Method 1: firewalld (Fedora, RHEL, CentOS)
+    if Command::new("firewall-cmd").arg("--state").output()
+        .map(|o| o.status.success()).unwrap_or(false)
+    {
+        // firewalld handles masquerade via the trusted zone (set in ensure_bridge)
+        log::info!("NAT handled by firewalld trusted zone masquerade");
+        return Ok(());
+    }
+
+    // Method 2: iptables (Ubuntu, Debian, older systems)
     if Command::new("iptables").arg("--version").output().is_ok() {
         // Check if the MASQUERADE rule already exists
         let output = Command::new("iptables")
@@ -199,73 +173,57 @@ pub fn setup_nat() -> Result<()> {
             }
         }
 
-        run_cmd(
-            "iptables",
-            &["-t", "nat", "-A", "POSTROUTING", "-s", BRIDGE_SUBNET, "-j", "MASQUERADE"],
-        )
-        .ok();
-        run_cmd(
-            "iptables",
-            &["-A", "FORWARD", "-s", BRIDGE_SUBNET, "-j", "ACCEPT"],
-        )
-        .ok();
-        run_cmd(
-            "iptables",
-            &["-A", "FORWARD", "-d", BRIDGE_SUBNET, "-j", "ACCEPT"],
-        )
-        .ok();
+        run_cmd("iptables", &["-t", "nat", "-A", "POSTROUTING", "-s", BRIDGE_SUBNET, "-j", "MASQUERADE"]).ok();
+        run_cmd("iptables", &["-A", "FORWARD", "-s", BRIDGE_SUBNET, "-j", "ACCEPT"]).ok();
+        run_cmd("iptables", &["-A", "FORWARD", "-d", BRIDGE_SUBNET, "-j", "ACCEPT"]).ok();
         log::info!("added iptables NAT masquerade for {BRIDGE_SUBNET}");
         return Ok(());
     }
 
-    // Fallback: nftables
+    // Method 3: nftables directly (modern Fedora without iptables compat)
     if Command::new("nft").arg("list").arg("ruleset").output().is_ok() {
-        run_cmd("nft", &["add", "table", "ip", "corten"]).ok();
-        run_cmd(
-            "nft",
-            &[
-                "add", "chain", "ip", "corten", "postrouting",
-                "{ type nat hook postrouting priority 100 ; }",
-            ],
-        )
-        .ok();
-        run_cmd(
-            "nft",
-            &[
-                "add", "rule", "ip", "corten", "postrouting",
-                "ip", "saddr", BRIDGE_SUBNET, "masquerade",
-            ],
-        )
-        .ok();
-        run_cmd(
-            "nft",
-            &[
-                "add", "chain", "ip", "corten", "forward",
-                "{ type filter hook forward priority 0 ; }",
-            ],
-        )
-        .ok();
-        run_cmd(
-            "nft",
-            &[
-                "add", "rule", "ip", "corten", "forward",
-                "ip", "saddr", BRIDGE_SUBNET, "accept",
-            ],
-        )
-        .ok();
-        run_cmd(
-            "nft",
-            &[
-                "add", "rule", "ip", "corten", "forward",
-                "ip", "daddr", BRIDGE_SUBNET, "accept",
-            ],
-        )
-        .ok();
+        run_cmd("nft", &[
+            "add", "table", "ip", "corten",
+        ]).ok();
+        run_cmd("nft", &[
+            "add", "chain", "ip", "corten", "postrouting",
+            "{ type nat hook postrouting priority 100 ; }",
+        ]).ok();
+        run_cmd("nft", &[
+            "add", "rule", "ip", "corten", "postrouting",
+            "ip", "saddr", BRIDGE_SUBNET, "masquerade",
+        ]).ok();
+        run_cmd("nft", &[
+            "add", "chain", "ip", "corten", "forward",
+            "{ type filter hook forward priority 0 ; }",
+        ]).ok();
+        run_cmd("nft", &[
+            "add", "rule", "ip", "corten", "forward",
+            "ip", "saddr", BRIDGE_SUBNET, "accept",
+        ]).ok();
+        run_cmd("nft", &[
+            "add", "rule", "ip", "corten", "forward",
+            "ip", "daddr", BRIDGE_SUBNET, "accept",
+        ]).ok();
         log::info!("added nftables NAT masquerade for {BRIDGE_SUBNET}");
         return Ok(());
     }
 
-    log::warn!("no firewall tool found (iptables/nft) — NAT may not work");
+    log::warn!("no firewall tool found (firewalld/iptables/nft) — NAT may not work");
+
+    // Allow forwarding for container traffic (FORWARD chain may default to DROP)
+    run_cmd(
+        "iptables",
+        &["-A", "FORWARD", "-s", BRIDGE_SUBNET, "-j", "ACCEPT"],
+    )
+    .ok();
+    run_cmd(
+        "iptables",
+        &["-A", "FORWARD", "-d", BRIDGE_SUBNET, "-j", "ACCEPT"],
+    )
+    .ok();
+
+    log::info!("added FORWARD accept rules for {BRIDGE_SUBNET}");
     Ok(())
 }
 
@@ -279,7 +237,7 @@ pub fn setup_nat() -> Result<()> {
 /// 2. Attaches the host side to the `corten0` bridge
 /// 3. Moves the container side into the container's network namespace
 /// 4. Allocates an IP address from the 10.0.42.0/24 pool
-/// 5. Configures the container side (IP, default route) via setns()
+/// 5. Configures the container side (IP, default route)
 ///
 /// # Arguments
 ///
@@ -288,92 +246,63 @@ pub fn setup_nat() -> Result<()> {
 pub fn setup_container_network(container_id: &str, child_pid: i32) -> Result<ContainerNetwork> {
     let short_id = &container_id[..8];
     let veth_host = format!("veth-{short_id}");
+    // Use unique peer name in host namespace, rename to eth0 inside container
     let veth_peer = format!("peer-{short_id}");
 
     log::info!("setting up network for container {short_id} (PID {child_pid})");
 
-    let ip = allocate_ip().context("failed to allocate container IP")?;
+    // Clean up stale veth if exists from a crashed run
+    run_cmd("ip", &["link", "del", &veth_host]).ok();
 
-    // Phase 1: Host-side netlink operations (create veth, attach to bridge, move peer)
-    let veth_host2 = veth_host.clone();
-    let veth_peer2 = veth_peer.clone();
-    netlink_block!(async move {
-        let (veth_host, veth_peer) = (veth_host2, veth_peer2);
-        let (connection, handle, _) = rtnetlink::new_connection()?;
-        tokio::spawn(connection);
+    // 1. Create the veth pair (both names unique in host namespace)
+    run_cmd(
+        "ip",
+        &[
+            "link", "add", &veth_host, "type", "veth",
+            "peer", "name", &veth_peer,
+        ],
+    )
+    .with_context(|| format!("failed to create veth pair {veth_host} <-> {veth_peer}"))?;
 
-        // Clean up stale veth if exists (ignore errors — interface may not exist)
-        let mut links = handle.link().get().match_name(veth_host.clone()).execute();
-        if let Ok(Some(link)) = links.try_next().await {
-            handle.link().del(link.header.index).execute().await.ok();
-        }
+    // 2. Attach host side to the bridge
+    run_cmd("ip", &["link", "set", &veth_host, "master", BRIDGE_NAME])
+        .with_context(|| format!("failed to attach {veth_host} to {BRIDGE_NAME}"))?;
 
-        // 1. Create veth pair
-        log::debug!("creating veth pair {veth_host} <-> {veth_peer}");
-        handle
-            .link()
-            .add()
-            .veth(veth_host.clone(), veth_peer.clone())
-            .execute()
-            .await
-            .context("failed to create veth pair")?;
-        log::debug!("veth pair created");
+    // 3. Bring up the host side
+    run_cmd("ip", &["link", "set", &veth_host, "up"])
+        .with_context(|| format!("failed to bring up {veth_host}"))?;
 
-        // 2. Get bridge index
-        let mut links = handle.link().get().match_name(BRIDGE_NAME.to_string()).execute();
-        let bridge = links
-            .try_next()
-            .await?
-            .ok_or_else(|| anyhow!("bridge {BRIDGE_NAME} not found"))?;
-        let bridge_idx = bridge.header.index;
-
-        // 3. Get host veth index and attach to bridge
-        let mut links = handle.link().get().match_name(veth_host.clone()).execute();
-        let host_veth = links
-            .try_next()
-            .await?
-            .ok_or_else(|| anyhow!("veth {veth_host} not found"))?;
-        let host_veth_idx = host_veth.header.index;
-
-        handle
-            .link()
-            .set(host_veth_idx)
-            .controller(bridge_idx)
-            .execute()
-            .await
-            .context("failed to attach veth to bridge")?;
-        handle
-            .link()
-            .set(host_veth_idx)
-            .up()
-            .execute()
-            .await
-            .context("failed to bring up host veth")?;
-
-        // 4. Get peer veth index and move to container netns
-        log::debug!("looking up peer veth {veth_peer}");
-        let mut links = handle.link().get().match_name(veth_peer.clone()).execute();
-        let peer_veth = links
-            .try_next()
-            .await?
-            .ok_or_else(|| anyhow!("peer veth not found"))?;
-        let peer_veth_idx = peer_veth.header.index;
-
-        log::debug!("moving peer veth idx={peer_veth_idx} to PID {child_pid}");
-        handle
-            .link()
-            .set(peer_veth_idx)
-            .setns_by_pid(child_pid as u32)
-            .execute()
-            .await
-            .context("failed to move veth to container netns")?;
-        log::debug!("veth moved successfully");
-
-        Ok::<_, anyhow::Error>(())
+    // 4. Move the peer into the container's network namespace
+    let pid_str = child_pid.to_string();
+    run_cmd(
+        "ip",
+        &["link", "set", &veth_peer, "netns", &pid_str],
+    )
+    .with_context(|| {
+        format!("failed to move {veth_peer} into namespace of PID {child_pid}")
     })?;
 
-    // Phase 2: Configure inside the container's network namespace using setns()
-    configure_container_netns(child_pid, &veth_peer, &ip, BRIDGE_IP)?;
+    // 5. Rename peer to eth0 inside the container namespace
+    let net_ns = format!("--net=/proc/{child_pid}/ns/net");
+    run_cmd(
+        "nsenter",
+        &[&net_ns, "ip", "link", "set", &veth_peer, "name", "eth0"],
+    )
+    .with_context(|| format!("failed to rename {veth_peer} to eth0 in container"))?;
+
+    // 6. Allocate an IP address
+    let ip = allocate_ip().context("failed to allocate container IP")?;
+    let ip_cidr = format!("{ip}/24");
+
+    // 7. Configure eth0 inside the container namespace
+    run_cmd("nsenter", &[&net_ns, "ip", "addr", "add", &ip_cidr, "dev", "eth0"])
+        .with_context(|| format!("failed to assign {ip_cidr} to eth0"))?;
+
+    run_cmd("nsenter", &[&net_ns, "ip", "link", "set", "eth0", "up"])
+        .with_context(|| "failed to bring up eth0 in container".to_string())?;
+
+    run_cmd("nsenter", &[&net_ns, "ip", "route", "add", "default", "via", BRIDGE_IP])
+        .with_context(|| format!("failed to add default route via {BRIDGE_IP}"))?;
 
     log::info!(
         "container {short_id}: network configured (IP={ip}, bridge={BRIDGE_NAME}, veth={veth_host})"
@@ -384,116 +313,6 @@ pub fn setup_container_network(container_id: &str, child_pid: i32) -> Result<Con
         bridge: BRIDGE_NAME.to_string(),
         veth_host,
     })
-}
-
-/// Enter a container's network namespace via setns(), configure networking,
-/// then return to the host namespace.
-fn configure_container_netns(
-    child_pid: i32,
-    veth_peer: &str,
-    ip: &str,
-    gateway: &str,
-) -> Result<()> {
-    // Open the container's net namespace
-    // Need to temporarily become root to access /proc/<pid>/ns/net
-    let orig_uid = unsafe { libc::getuid() };
-    let orig_gid = unsafe { libc::getgid() };
-    unsafe { libc::setegid(0); libc::seteuid(0); }
-
-    let ns_path = format!("/proc/{child_pid}/ns/net");
-    let ns_fd = std::fs::File::open(&ns_path).context("failed to open container net namespace")?;
-
-    // Save our current namespace so we can return to it
-    let my_ns =
-        std::fs::File::open("/proc/self/ns/net").context("failed to open own net namespace")?;
-
-    // Enter container's namespace
-    nix::sched::setns(ns_fd.as_fd(), nix::sched::CloneFlags::CLONE_NEWNET)
-        .context("failed to setns into container")?;
-
-    // Configure networking inside the container namespace
-    let result = configure_inside_container_netns(veth_peer, ip, gateway);
-
-    // Always return to our own namespace, even if configuration failed
-    nix::sched::setns(my_ns.as_fd(), nix::sched::CloneFlags::CLONE_NEWNET)
-        .context("failed to return to host namespace")?;
-
-    // Restore original uid/gid
-    unsafe { libc::seteuid(orig_uid); libc::setegid(orig_gid); }
-
-    result
-}
-
-/// Configure networking inside the container's network namespace.
-/// Must be called while already in the container's netns.
-fn configure_inside_container_netns(veth_peer: &str, ip: &str, gateway: &str) -> Result<()> {
-    netlink_block!(async move {
-        let (connection, handle, _) = rtnetlink::new_connection()?;
-        tokio::spawn(connection);
-
-        // Find the peer veth (it's now in this namespace)
-        let mut links = handle.link().get().execute();
-        let mut peer_idx = None;
-        while let Some(link) = links.try_next().await? {
-            for nla in &link.attributes {
-                if let netlink_packet_route::link::LinkAttribute::IfName(name) = nla {
-                    if name == veth_peer {
-                        peer_idx = Some(link.header.index);
-                    }
-                }
-            }
-        }
-
-        let idx = peer_idx.ok_or_else(|| anyhow!("peer veth not found in container ns"))?;
-
-        // Rename to eth0
-        handle
-            .link()
-            .set(idx)
-            .name("eth0".to_string())
-            .execute()
-            .await
-            .context("failed to rename veth to eth0")?;
-
-        // Add IP address
-        let addr: std::net::Ipv4Addr = ip.parse()?;
-        handle
-            .address()
-            .add(idx, std::net::IpAddr::V4(addr), 24)
-            .execute()
-            .await
-            .context("failed to assign IP")?;
-
-        // Bring up eth0
-        handle
-            .link()
-            .set(idx)
-            .up()
-            .execute()
-            .await
-            .context("failed to bring up eth0")?;
-
-        // Bring up loopback too
-        let mut lo_links = handle.link().get().match_name("lo".to_string()).execute();
-        if let Some(lo) = lo_links.try_next().await? {
-            handle.link().set(lo.header.index).up().execute().await.ok();
-        }
-
-        // Add default route via bridge gateway
-        let gw: std::net::Ipv4Addr = gateway.parse()?;
-        handle
-            .route()
-            .add()
-            .v4()
-            .destination_prefix(std::net::Ipv4Addr::new(0, 0, 0, 0), 0)
-            .gateway(gw)
-            .execute()
-            .await
-            .context("failed to add default route")?;
-
-        Ok::<_, anyhow::Error>(())
-    })?;
-    Ok(())
 }
 
 /// Copy the host's DNS configuration into the container rootfs.
@@ -541,21 +360,23 @@ pub fn cleanup_container_network(container_id: &str) -> Result<()> {
     let short_id = &container_id[..8];
     let veth_host = format!("veth-{short_id}");
 
-    netlink_block!(async move {
-        let (connection, handle, _) = rtnetlink::new_connection()?;
-        tokio::spawn(connection);
+    // Delete the veth pair (removes both ends)
+    let output = Command::new("ip")
+        .args(["link", "show", &veth_host])
+        .output();
 
-        let mut links = handle.link().get().match_name(veth_host.clone()).execute();
-        if let Some(link) = links.try_next().await? {
-            handle.link().del(link.header.index).execute().await.ok();
+    if let Ok(output) = output {
+        if output.status.success() {
+            run_cmd("ip", &["link", "del", &veth_host]).ok();
             log::info!("deleted veth pair {veth_host}");
         } else {
-            log::info!("veth {veth_host} already gone");
+            log::info!("veth {veth_host} already gone (container exited)");
         }
-        Ok::<_, anyhow::Error>(())
-    })?;
+    }
 
+    // Release the allocated IP (best-effort; the allocator is simple)
     release_ip(container_id).ok();
+
     Ok(())
 }
 
@@ -565,12 +386,13 @@ pub fn cleanup_container_network(container_id: &str) -> Result<()> {
 /// last-octet value in `/var/lib/corten/network/next_ip`. IPs start
 /// at 10.0.42.2 (since .1 is the bridge) and go up to .254.
 fn allocate_ip() -> Result<String> {
-    fs::create_dir_all(NETWORK_STATE_DIR).context("failed to create network state directory")?;
+    fs::create_dir_all(NETWORK_STATE_DIR)
+        .context("failed to create network state directory")?;
 
     // Read current next IP octet, default to 2 (first usable address)
     let next_octet: u8 = if Path::new(NEXT_IP_FILE).exists() {
-        let content =
-            fs::read_to_string(NEXT_IP_FILE).context("failed to read next_ip file")?;
+        let content = fs::read_to_string(NEXT_IP_FILE)
+            .context("failed to read next_ip file")?;
         content
             .trim()
             .parse()
@@ -589,7 +411,8 @@ fn allocate_ip() -> Result<String> {
 
     // Write the next octet for the next allocation
     let next = next_octet + 1;
-    fs::write(NEXT_IP_FILE, next.to_string()).context("failed to update next_ip file")?;
+    fs::write(NEXT_IP_FILE, next.to_string())
+        .context("failed to update next_ip file")?;
 
     // Record the allocation keyed by container ID
     log::info!("allocated IP {ip} (next available: 10.0.42.{next})");
@@ -620,6 +443,9 @@ pub fn setup_port_forwarding(
     container_ip: &str,
     ports: &[crate::config::PortMapping],
 ) -> Result<()> {
+    // Always use iptables for port forwarding (DNAT).
+    // firewalld's --add-forward-port only handles external traffic,
+    // not localhost. iptables DNAT works for both.
     for port in ports {
         let dport = port.host_port.to_string();
         let to_dest = format!("{container_ip}:{}", port.container_port);
@@ -628,33 +454,30 @@ pub fn setup_port_forwarding(
         run_cmd(
             "iptables",
             &[
-                "-t", "nat", "-I", "PREROUTING", "-p", "tcp", "--dport", &dport, "-j", "DNAT",
-                "--to-destination", &to_dest,
+                "-t", "nat", "-I", "PREROUTING",
+                "-p", "tcp", "--dport", &dport,
+                "-j", "DNAT", "--to-destination", &to_dest,
             ],
         )
-        .with_context(|| {
-            format!(
-                "failed to add DNAT rule for {}:{} -> {}:{}",
-                port.host_ip, port.host_port, container_ip, port.container_port
-            )
-        })?;
+        .with_context(|| format!(
+            "failed to add DNAT rule for {}:{} -> {}:{}",
+            port.host_ip, port.host_port, container_ip, port.container_port
+        ))?;
 
         // OUTPUT: localhost traffic (curl http://127.0.0.1:port)
         run_cmd(
             "iptables",
             &[
-                "-t", "nat", "-I", "OUTPUT", "-p", "tcp", "--dport", &dport, "-j", "DNAT",
-                "--to-destination", &to_dest,
+                "-t", "nat", "-I", "OUTPUT",
+                "-p", "tcp", "--dport", &dport,
+                "-j", "DNAT", "--to-destination", &to_dest,
             ],
         )
         .ok();
 
         log::info!(
             "port forwarding: {}:{} -> {}:{}",
-            port.host_ip,
-            port.host_port,
-            container_ip,
-            port.container_port
+            port.host_ip, port.host_port, container_ip, port.container_port
         );
     }
     Ok(())
@@ -673,8 +496,9 @@ pub fn cleanup_port_forwarding(
         run_cmd(
             "iptables",
             &[
-                "-t", "nat", "-D", "PREROUTING", "-p", "tcp", "--dport", &dport, "-j", "DNAT",
-                "--to-destination", &to_dest,
+                "-t", "nat", "-D", "PREROUTING",
+                "-p", "tcp", "--dport", &dport,
+                "-j", "DNAT", "--to-destination", &to_dest,
             ],
         )
         .ok();
@@ -683,7 +507,9 @@ pub fn cleanup_port_forwarding(
         run_cmd(
             "iptables",
             &[
-                "-t", "nat", "-D", "OUTPUT", "-d", &port.host_ip, "-p", "tcp", "--dport", &dport,
+                "-t", "nat", "-D", "OUTPUT",
+                "-d", &port.host_ip,
+                "-p", "tcp", "--dport", &dport,
                 "-j", "DNAT", "--to-destination", &to_dest,
             ],
         )
@@ -691,10 +517,7 @@ pub fn cleanup_port_forwarding(
 
         log::info!(
             "removed port forwarding: {}:{} -> {}:{}",
-            port.host_ip,
-            port.host_port,
-            container_ip,
-            port.container_port
+            port.host_ip, port.host_port, container_ip, port.container_port
         );
     }
     Ok(())
@@ -713,9 +536,9 @@ pub fn flush_port_forwarding() {
                 .output();
             let Ok(output) = output else { break };
             let rules = String::from_utf8_lossy(&output.stdout);
-            let rule_to_delete = rules
-                .lines()
-                .find(|line| line.contains("DNAT") && line.contains("10.0.42."));
+            let rule_to_delete = rules.lines().find(|line| {
+                line.contains("DNAT") && line.contains("10.0.42.")
+            });
             if let Some(rule) = rule_to_delete {
                 // Convert -A to -D for deletion
                 let delete_rule = rule.replacen("-A", "-D", 1);
@@ -736,34 +559,23 @@ pub fn flush_port_forwarding() {
 
 /// Clean up all stale corten veth interfaces.
 pub fn cleanup_stale_veths() {
-    let _: Result<()> = netlink_block!(async move {
-        let (connection, handle, _) = rtnetlink::new_connection()?;
-        tokio::spawn(connection);
-
-        let mut links = handle.link().get().execute();
-        let mut to_delete = Vec::new();
-
-        while let Ok(Some(link)) = links.try_next().await {
-            for nla in &link.attributes {
-                if let netlink_packet_route::link::LinkAttribute::IfName(name) = nla {
-                    if name.starts_with("veth-") || name.starts_with("peer-") {
-                        let has_lower_up = link.header.flags.iter().any(|f| {
-                            matches!(f, netlink_packet_route::link::LinkFlag::LowerUp)
-                        });
-                        if !has_lower_up {
-                            to_delete.push((link.header.index, name.clone()));
-                        }
+    let output = Command::new("ip").args(["link", "show"]).output();
+    if let Ok(output) = output {
+        let links = String::from_utf8_lossy(&output.stdout);
+        for line in links.lines() {
+            // Match veth-XXXXXXXX (corten veth host side)
+            if let Some(start) = line.find("veth-") {
+                let name: String = line[start..].chars().take_while(|c| !c.is_whitespace() && *c != '@').collect();
+                if name.starts_with("veth-") && name.len() <= 14 {
+                    // Check if it's NO-CARRIER (peer is gone)
+                    if line.contains("NO-CARRIER") || line.contains("LOWERLAYERDOWN") {
+                        run_cmd("ip", &["link", "del", &name]).ok();
+                        log::info!("cleaned up stale veth: {name}");
                     }
                 }
             }
         }
-
-        for (idx, name) in to_delete {
-            handle.link().del(idx).execute().await.ok();
-            log::info!("cleaned up stale veth: {name}");
-        }
-        Ok(())
-    });
+    }
 }
 
 // =============================================================================
@@ -784,7 +596,7 @@ pub struct NetworkInfo {
     pub subnet: String,
     /// Gateway IP (e.g., "10.0.43.1")
     pub gateway: String,
-    /// Container name -> IP mappings for DNS resolution
+    /// Container name → IP mappings for DNS resolution
     pub containers: std::collections::HashMap<String, String>,
 }
 
@@ -808,64 +620,20 @@ pub fn create_network(name: &str) -> Result<NetworkInfo> {
     let gateway_cidr = format!("{gateway}/24");
     let bridge_name = format!("corten-{}", &name[..name.len().min(10)]);
 
-    // Create the bridge via netlink
-    let nl_bridge = bridge_name.clone();
-    let nl_gateway = gateway.clone();
-    let nl_gateway_cidr = gateway_cidr.clone();
-    netlink_block!(async move {
-        let (bridge_name, gateway, gateway_cidr) = (nl_bridge, nl_gateway, nl_gateway_cidr);
-        let (connection, handle, _) = rtnetlink::new_connection()?;
-        tokio::spawn(connection);
-
-        handle
-            .link()
-            .add()
-            .bridge(bridge_name.clone())
-            .execute()
-            .await
-            .with_context(|| format!("failed to create bridge {bridge_name}"))?;
-
-        let mut links = handle.link().get().match_name(bridge_name.clone()).execute();
-        let bridge = links
-            .try_next()
-            .await?
-            .ok_or_else(|| anyhow!("bridge {bridge_name} not found after creation"))?;
-        let bridge_idx = bridge.header.index;
-
-        let addr: std::net::Ipv4Addr = gateway.parse()?;
-        handle
-            .address()
-            .add(bridge_idx, std::net::IpAddr::V4(addr), 24)
-            .execute()
-            .await
-            .with_context(|| format!("failed to assign {gateway_cidr} to {bridge_name}"))?;
-
-        handle
-            .link()
-            .set(bridge_idx)
-            .up()
-            .execute()
-            .await
-            .with_context(|| format!("failed to bring up {bridge_name}"))?;
-
-        Ok::<_, anyhow::Error>(())
-    })?;
+    // Create the bridge
+    run_cmd("ip", &["link", "add", &bridge_name, "type", "bridge"])
+        .with_context(|| format!("failed to create bridge {bridge_name}"))?;
+    run_cmd("ip", &["addr", "add", &gateway_cidr, "dev", &bridge_name])
+        .with_context(|| format!("failed to assign {gateway_cidr} to {bridge_name}"))?;
+    run_cmd("ip", &["link", "set", &bridge_name, "up"])
+        .with_context(|| format!("failed to bring up {bridge_name}"))?;
 
     // Add NAT for the new subnet
     run_cmd(
         "iptables",
-        &[
-            "-t",
-            "nat",
-            "-A",
-            "POSTROUTING",
-            "-s",
-            &subnet,
-            "-j",
-            "MASQUERADE",
-        ],
+        &["-t", "nat", "-A", "POSTROUTING", "-s", &subnet, "-j", "MASQUERADE"],
     )
-    .ok();
+    .ok(); // Best-effort
 
     let info = NetworkInfo {
         name: name.to_string(),
@@ -928,32 +696,13 @@ pub fn remove_network(name: &str) -> Result<()> {
         ));
     }
 
-    // Delete the bridge via netlink
-    netlink_block!(async move {
-        let (connection, handle, _) = rtnetlink::new_connection()?;
-        tokio::spawn(connection);
-
-        let mut links = handle.link().get().match_name(info.bridge.clone()).execute();
-        if let Some(link) = links.try_next().await? {
-            handle.link().del(link.header.index).execute().await.ok();
-        }
-        Ok::<_, anyhow::Error>(())
-    })
-    .ok();
+    // Delete the bridge
+    run_cmd("ip", &["link", "del", &info.bridge]).ok();
 
     // Remove NAT rule
     run_cmd(
         "iptables",
-        &[
-            "-t",
-            "nat",
-            "-D",
-            "POSTROUTING",
-            "-s",
-            &info.subnet,
-            "-j",
-            "MASQUERADE",
-        ],
+        &["-t", "nat", "-D", "POSTROUTING", "-s", &info.subnet, "-j", "MASQUERADE"],
     )
     .ok();
 
@@ -967,16 +716,14 @@ pub fn remove_network(name: &str) -> Result<()> {
 /// Load a named network's metadata.
 pub fn load_network(name: &str) -> Result<NetworkInfo> {
     let meta_path = Path::new(NETWORKS_DIR).join(name).join("network.json");
-    let data =
-        fs::read_to_string(&meta_path).with_context(|| format!("network '{name}' not found"))?;
+    let data = fs::read_to_string(&meta_path)
+        .with_context(|| format!("network '{name}' not found"))?;
     serde_json::from_str(&data).context("failed to parse network metadata")
 }
 
 /// Save updated network metadata.
 fn save_network(info: &NetworkInfo) -> Result<()> {
-    let meta_path = Path::new(NETWORKS_DIR)
-        .join(&info.name)
-        .join("network.json");
+    let meta_path = Path::new(NETWORKS_DIR).join(&info.name).join("network.json");
     fs::write(&meta_path, serde_json::to_string_pretty(info)?)
         .context("failed to save network metadata")
 }
@@ -1039,10 +786,8 @@ pub fn setup_named_network_dns(
     fs::write(container_etc.join("hosts"), &hosts)
         .context("failed to write /etc/hosts for named network DNS")?;
 
-    log::info!(
-        "wrote /etc/hosts with {} entries for network '{network_name}'",
-        info.containers.len() + 1
-    );
+    log::info!("wrote /etc/hosts with {} entries for network '{network_name}'",
+        info.containers.len() + 1);
     Ok(())
 }
 
@@ -1056,84 +801,30 @@ pub fn setup_container_named_network(
 
     let short_id = &container_id[..8];
     let veth_host = format!("veth-{short_id}");
-    let veth_peer = format!("peer-{short_id}");
+    let veth_container = "eth0";
 
-    // Create veth pair, attach to bridge, move peer to container netns
-    let veth_host2 = veth_host.clone();
-    let veth_peer2 = veth_peer.clone();
-    let info_bridge = info.bridge.clone();
-    netlink_block!(async move {
-        let (veth_host, veth_peer) = (veth_host2, veth_peer2);
-        let info_bridge = info_bridge;
-        let (connection, handle, _) = rtnetlink::new_connection()?;
-        tokio::spawn(connection);
+    // Create veth pair
+    run_cmd(
+        "ip",
+        &["link", "add", &veth_host, "type", "veth", "peer", "name", veth_container],
+    )?;
 
-        // Create veth pair
-        handle
-            .link()
-            .add()
-            .veth(veth_host.clone(), veth_peer.clone())
-            .execute()
-            .await
-            .context("failed to create veth pair")?;
+    // Attach to the named network's bridge
+    run_cmd("ip", &["link", "set", &veth_host, "master", &info.bridge])?;
+    run_cmd("ip", &["link", "set", &veth_host, "up"])?;
 
-        // Get bridge index
-        let mut links = handle.link().get().match_name(info_bridge.clone()).execute();
-        let bridge = links
-            .try_next()
-            .await?
-            .ok_or_else(|| anyhow!("bridge {} not found", info_bridge))?;
-        let bridge_idx = bridge.header.index;
-
-        // Attach host veth to bridge and bring up
-        let mut links = handle.link().get().match_name(veth_host.clone()).execute();
-        let host_veth = links
-            .try_next()
-            .await?
-            .ok_or_else(|| anyhow!("veth {veth_host} not found"))?;
-        let host_veth_idx = host_veth.header.index;
-
-        handle
-            .link()
-            .set(host_veth_idx)
-            .controller(bridge_idx)
-            .execute()
-            .await?;
-        handle.link().set(host_veth_idx).up().execute().await?;
-
-        // Move peer to container netns
-        let mut links = handle.link().get().match_name(veth_peer.clone()).execute();
-        let peer_veth = links
-            .try_next()
-            .await?
-            .ok_or_else(|| anyhow!("peer veth not found"))?;
-        let peer_veth_idx = peer_veth.header.index;
-
-        handle
-            .link()
-            .set(peer_veth_idx)
-            .setns_by_pid(child_pid as u32)
-            .execute()
-            .await
-            .context("failed to move veth to container netns")?;
-
-        Ok::<_, anyhow::Error>(())
-    })?;
+    // Move container side into netns
+    let pid_str = child_pid.to_string();
+    run_cmd("ip", &["link", "set", veth_container, "netns", &pid_str])?;
 
     // Allocate IP from the named network's subnet
-    let third_octet: u8 = info
-        .gateway
-        .split('.')
-        .nth(2)
+    let third_octet: u8 = info.gateway.split('.').nth(2)
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| anyhow!("invalid gateway IP in network '{network_name}'"))?;
 
     let next_ip_file = format!("{NETWORKS_DIR}/{network_name}/next_ip");
     let next_octet: u8 = if Path::new(&next_ip_file).exists() {
-        fs::read_to_string(&next_ip_file)?
-            .trim()
-            .parse()
-            .unwrap_or(2)
+        fs::read_to_string(&next_ip_file)?.trim().parse().unwrap_or(2)
     } else {
         2
     };
@@ -1143,10 +834,14 @@ pub fn setup_container_named_network(
     }
 
     let ip = format!("10.0.{third_octet}.{next_octet}");
+    let ip_cidr = format!("{ip}/24");
     fs::write(&next_ip_file, (next_octet + 1).to_string())?;
 
-    // Configure container side via setns
-    configure_container_netns(child_pid, &veth_peer, &ip, &info.gateway)?;
+    // Configure container side
+    let ns_path = format!("/proc/{child_pid}/ns/net");
+    run_cmd("nsenter", &["--net", &ns_path, "ip", "addr", "add", &ip_cidr, "dev", veth_container])?;
+    run_cmd("nsenter", &["--net", &ns_path, "ip", "link", "set", veth_container, "up"])?;
+    run_cmd("nsenter", &["--net", &ns_path, "ip", "route", "add", "default", "via", &info.gateway])?;
 
     log::info!(
         "container {short_id}: connected to network '{network_name}' (IP={ip}, bridge={})",
@@ -1166,10 +861,7 @@ fn allocate_network_octet() -> Result<u8> {
     fs::create_dir_all(NETWORKS_DIR)?;
 
     let octet: u8 = if Path::new(&alloc_file).exists() {
-        fs::read_to_string(&alloc_file)?
-            .trim()
-            .parse()
-            .unwrap_or(43)
+        fs::read_to_string(&alloc_file)?.trim().parse().unwrap_or(43)
     } else {
         43 // Start at 43 (42 is the default bridge)
     };
