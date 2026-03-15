@@ -302,9 +302,9 @@ pub fn setup_container_network(container_id: &str, child_pid: i32) -> Result<Con
         let (connection, handle, _) = rtnetlink::new_connection()?;
         tokio::spawn(connection);
 
-        // Clean up stale veth if exists
+        // Clean up stale veth if exists (ignore errors — interface may not exist)
         let mut links = handle.link().get().match_name(veth_host.clone()).execute();
-        if let Some(link) = links.try_next().await? {
+        if let Ok(Some(link)) = links.try_next().await {
             handle.link().del(link.header.index).execute().await.ok();
         }
 
