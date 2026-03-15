@@ -52,6 +52,8 @@ pub struct ContainerNetwork {
 /// container. The loopback interface exists in every network namespace
 /// by default, but starts in the DOWN state.
 pub fn setup_loopback() -> Result<()> {
+    // Loopback runs inside the container namespace (child process)
+    // which is already root, so no pre_exec needed here
     let output = Command::new("ip")
         .args(["link", "set", "lo", "up"])
         .output()
@@ -71,7 +73,7 @@ pub fn setup_loopback() -> Result<()> {
 /// brings it up, and enables IP forwarding on the host.
 pub fn ensure_bridge() -> Result<()> {
     // Check if bridge already exists
-    let output = Command::new("ip")
+    let output = root_cmd("ip")
         .args(["link", "show", BRIDGE_NAME])
         .output()
         .context("failed to check for bridge interface")?;
@@ -101,7 +103,7 @@ pub fn ensure_bridge() -> Result<()> {
 
     // On systems with firewalld (Fedora, RHEL, CentOS), add the bridge
     // to the trusted zone so container traffic isn't blocked by the firewall.
-    if Command::new("firewall-cmd").arg("--state").output()
+    if root_cmd("firewall-cmd").arg("--state").output()
         .map(|o| o.status.success()).unwrap_or(false)
     {
         run_cmd("firewall-cmd", &[
@@ -117,7 +119,7 @@ pub fn ensure_bridge() -> Result<()> {
     // If Docker is running, its FORWARD chain has policy DROP and routes
     // everything through DOCKER-USER first. Insert our ACCEPT rules there
     // so Corten bridge traffic isn't blocked by Docker's firewall.
-    let docker_user_exists = Command::new("iptables")
+    let docker_user_exists = root_cmd("iptables")
         .args(["-L", "DOCKER-USER", "-n"])
         .output()
         .map(|o| o.status.success())
@@ -125,7 +127,7 @@ pub fn ensure_bridge() -> Result<()> {
 
     if docker_user_exists {
         // Check if rules already exist before inserting
-        let already_has_rule = Command::new("iptables")
+        let already_has_rule = root_cmd("iptables")
             .args(["-C", "DOCKER-USER", "-s", BRIDGE_SUBNET, "-j", "ACCEPT"])
             .output()
             .map(|o| o.status.success())
@@ -151,7 +153,7 @@ pub fn ensure_bridge() -> Result<()> {
 /// Tries firewalld first (Fedora/RHEL), then iptables, then nftables.
 pub fn setup_nat() -> Result<()> {
     // Method 1: firewalld (Fedora, RHEL, CentOS)
-    if Command::new("firewall-cmd").arg("--state").output()
+    if root_cmd("firewall-cmd").arg("--state").output()
         .map(|o| o.status.success()).unwrap_or(false)
     {
         // firewalld handles masquerade via the trusted zone (set in ensure_bridge)
@@ -160,9 +162,8 @@ pub fn setup_nat() -> Result<()> {
     }
 
     // Method 2: iptables (Ubuntu, Debian, older systems)
-    if Command::new("iptables").arg("--version").output().is_ok() {
-        // Check if the MASQUERADE rule already exists
-        let output = Command::new("iptables")
+    if root_cmd("iptables").arg("--version").output().is_ok() {
+        let output = root_cmd("iptables")
             .args(["-t", "nat", "-C", "POSTROUTING", "-s", BRIDGE_SUBNET, "-j", "MASQUERADE"])
             .output();
 
@@ -181,7 +182,7 @@ pub fn setup_nat() -> Result<()> {
     }
 
     // Method 3: nftables directly (modern Fedora without iptables compat)
-    if Command::new("nft").arg("list").arg("ruleset").output().is_ok() {
+    if root_cmd("nft").arg("list").arg("ruleset").output().is_ok() {
         run_cmd("nft", &[
             "add", "table", "ip", "corten",
         ]).ok();
@@ -361,7 +362,7 @@ pub fn cleanup_container_network(container_id: &str) -> Result<()> {
     let veth_host = format!("veth-{short_id}");
 
     // Delete the veth pair (removes both ends)
-    let output = Command::new("ip")
+    let output = root_cmd("ip")
         .args(["link", "show", &veth_host])
         .output();
 
@@ -531,7 +532,7 @@ pub fn flush_port_forwarding() {
     for chain in &["PREROUTING", "OUTPUT"] {
         // Keep removing matching rules until none left
         loop {
-            let output = Command::new("iptables")
+            let output = root_cmd("iptables")
                 .args(["-t", "nat", "-S", chain])
                 .output();
             let Ok(output) = output else { break };
@@ -543,7 +544,7 @@ pub fn flush_port_forwarding() {
                 // Convert -A to -D for deletion
                 let delete_rule = rule.replacen("-A", "-D", 1);
                 let args: Vec<&str> = delete_rule.split_whitespace().collect();
-                let mut cmd = Command::new("iptables");
+                let mut cmd = root_cmd("iptables");
                 cmd.arg("-t").arg("nat");
                 for arg in &args {
                     cmd.arg(arg);
@@ -559,7 +560,7 @@ pub fn flush_port_forwarding() {
 
 /// Clean up all stale corten veth interfaces.
 pub fn cleanup_stale_veths() {
-    let output = Command::new("ip").args(["link", "show"]).output();
+    let output = root_cmd("ip").args(["link", "show"]).output();
     if let Ok(output) = output {
         let links = String::from_utf8_lossy(&output.stdout);
         for line in links.lines() {
@@ -874,11 +875,26 @@ fn allocate_network_octet() -> Result<u8> {
     Ok(octet)
 }
 
+/// Create a Command that will setuid(0) before exec.
+/// Needed because child processes don't inherit Linux capabilities.
+fn root_cmd(program: &str) -> Command {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = Command::new(program);
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setgid(0);
+            libc::setuid(0);
+            Ok(())
+        });
+    }
+    cmd
+}
+
 /// Run an external command and return an error if it fails.
 ///
 /// Captures stdout and stderr for logging on failure.
 fn run_cmd(program: &str, args: &[&str]) -> Result<()> {
-    let output = Command::new(program)
+    let output = root_cmd(program)
         .args(args)
         .output()
         .with_context(|| format!("failed to execute {program}"))?;
