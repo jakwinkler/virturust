@@ -33,6 +33,7 @@ fi
 
 DOCKER_PORT=9080
 CORTEN_PORT=9081
+CONTAINER_PORT=8080
 AB_REQUESTS=10000
 AB_CONCURRENCY=50
 
@@ -65,7 +66,8 @@ cat > "$DOCKER_DIR/Dockerfile" <<'DOCKERFILE'
 FROM alpine:3.20
 RUN apk add --no-cache nginx && \
     mkdir -p /run/nginx /var/www/html && \
-    echo '<h1>Docker Nginx</h1>' > /var/www/html/index.html
+    echo '<h1>Docker Nginx</h1>' > /var/www/html/index.html && \
+    printf 'server {\n  listen 8080 default_server;\n  root /var/www/html;\n  location / { try_files $uri $uri/ =404; }\n}\n' > /etc/nginx/http.d/default.conf
 CMD ["nginx", "-g", "daemon off;"]
 DOCKERFILE
 
@@ -100,8 +102,7 @@ run = [
     "mkdir -p /run/nginx /var/www/html /var/log/nginx /var/lib/nginx/tmp",
     "echo '<h1>Corten Nginx</h1>' > /var/www/html/index.html",
     "chown -R nginx:nginx /run/nginx /var/log/nginx /var/lib/nginx",
-    "printf 'server {\\n  listen 80 default_server;\\n  root /var/www/html;\\n  location / { try_files $uri $uri/ =404; }\\n}\\n' > /etc/nginx/http.d/default.conf",
-    "sed -i 's/^user nginx;/user root;/' /etc/nginx/nginx.conf",
+    "printf 'server {\\n  listen 8080 default_server;\\n  root /var/www/html;\\n  location / { try_files $uri $uri/ =404; }\\n}\\n' > /etc/nginx/http.d/default.conf",
 ]
 
 [container]
@@ -123,14 +124,14 @@ echo ""
 
 # --- Docker ---
 START=$(date +%s%N)
-docker run -d --name bench-docker-nginx -p $DOCKER_PORT:80 bench-nginx >/dev/null 2>&1
+docker run -d --name bench-docker-nginx -p $DOCKER_PORT:$CONTAINER_PORT bench-nginx >/dev/null 2>&1
 END=$(date +%s%N)
 DOCKER_START_MS=$(( (END - START) / 1000000 ))
 echo "  Docker start: ${DOCKER_START_MS}ms (port $DOCKER_PORT)"
 
 # --- Corten ---
 START=$(date +%s%N)
-$CORTEN run -d --name bench-corten-nginx -p $CORTEN_PORT:80 bench-nginx >/dev/null 2>&1
+$CORTEN run -d --name bench-corten-nginx -p $CORTEN_PORT:$CONTAINER_PORT bench-nginx >/dev/null 2>&1
 END=$(date +%s%N)
 CORTEN_START_MS=$(( (END - START) / 1000000 ))
 echo "  Corten start: ${CORTEN_START_MS}ms (port $CORTEN_PORT)"
