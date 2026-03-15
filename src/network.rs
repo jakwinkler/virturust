@@ -99,6 +99,13 @@ pub fn ensure_bridge() -> Result<()> {
     // Enable IP forwarding
     fs::write("/proc/sys/net/ipv4/ip_forward", "1")
         .context("failed to enable IP forwarding")?;
+
+    // Enable routing of loopback traffic through NAT.
+    // Without this, localhost DNAT (curl 127.0.0.1:port -> container) is
+    // silently dropped as "martian" by the kernel. Docker uses docker-proxy
+    // to work around this; we use route_localnet instead.
+    fs::write("/proc/sys/net/ipv4/conf/all/route_localnet", "1").ok();
+
     log::info!("IP forwarding enabled");
 
     // On systems with firewalld (Fedora, RHEL, CentOS), add the bridge
@@ -444,37 +451,52 @@ pub fn setup_port_forwarding(
     container_ip: &str,
     ports: &[crate::config::PortMapping],
 ) -> Result<()> {
-    // Always use iptables for port forwarding (DNAT).
-    // firewalld's --add-forward-port only handles external traffic,
-    // not localhost. iptables DNAT works for both.
     for port in ports {
         let dport = port.host_port.to_string();
+        let cport = port.container_port.to_string();
         let to_dest = format!("{container_ip}:{}", port.container_port);
 
-        // PREROUTING: external traffic arriving at the host
+        // 1. DNAT in PREROUTING: external traffic arriving at the host
         run_cmd(
             "iptables",
-            &[
-                "-t", "nat", "-I", "PREROUTING",
-                "-p", "tcp", "--dport", &dport,
-                "-j", "DNAT", "--to-destination", &to_dest,
-            ],
+            &["-t", "nat", "-I", "PREROUTING", "-p", "tcp", "--dport", &dport,
+              "-j", "DNAT", "--to-destination", &to_dest],
         )
         .with_context(|| format!(
             "failed to add DNAT rule for {}:{} -> {}:{}",
             port.host_ip, port.host_port, container_ip, port.container_port
         ))?;
 
-        // OUTPUT: localhost traffic (curl http://127.0.0.1:port)
+        // 2. DNAT in OUTPUT: localhost traffic (requires route_localnet=1)
         run_cmd(
             "iptables",
-            &[
-                "-t", "nat", "-I", "OUTPUT",
-                "-p", "tcp", "--dport", &dport,
-                "-j", "DNAT", "--to-destination", &to_dest,
-            ],
-        )
-        .ok();
+            &["-t", "nat", "-I", "OUTPUT", "-p", "tcp", "--dport", &dport,
+              "-j", "DNAT", "--to-destination", &to_dest],
+        ).ok();
+
+        // 3. MASQUERADE return traffic from container back to localhost
+        // Without this, container replies to 127.0.0.1 which gets dropped
+        run_cmd(
+            "iptables",
+            &["-t", "nat", "-I", "POSTROUTING", "-d", container_ip,
+              "-s", "127.0.0.0/8", "-p", "tcp", "--dport", &cport,
+              "-j", "MASQUERADE"],
+        ).ok();
+
+        // 4. FORWARD: explicit accept for DNATed traffic to container
+        // Needed because Docker sets FORWARD policy to DROP
+        run_cmd(
+            "iptables",
+            &["-I", "FORWARD", "-d", container_ip, "-o", BRIDGE_NAME,
+              "-p", "tcp", "--dport", &cport, "-j", "ACCEPT"],
+        ).ok();
+
+        // 5. FORWARD: allow return traffic from container
+        run_cmd(
+            "iptables",
+            &["-I", "FORWARD", "-s", container_ip, "-i", BRIDGE_NAME,
+              "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"],
+        ).ok();
 
         log::info!(
             "port forwarding: {}:{} -> {}:{}",
