@@ -54,12 +54,22 @@ pub struct ContainerNetwork {
     pub veth_host: String,
 }
 
-/// Create a single-threaded tokio runtime for netlink operations.
-fn netlink_runtime() -> Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("failed to create tokio runtime for netlink")
+/// Run an async block on a fresh tokio runtime in a dedicated thread.
+/// Avoids "cannot block_on inside runtime" when called from #[tokio::main].
+macro_rules! netlink_block {
+    ($body:expr) => {{
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("failed to create netlink runtime")?;
+                rt.block_on($body)
+            })
+            .join()
+            .map_err(|_| anyhow!("netlink thread panicked"))?
+        })
+    }};
 }
 
 /// Bring up the loopback interface inside the container's network namespace.
@@ -68,8 +78,7 @@ fn netlink_runtime() -> Result<tokio::runtime::Runtime> {
 /// container. The loopback interface exists in every network namespace
 /// by default, but starts in the DOWN state.
 pub fn setup_loopback() -> Result<()> {
-    let rt = netlink_runtime()?;
-    rt.block_on(async {
+    netlink_block!(async move {
         let (connection, handle, _) = rtnetlink::new_connection()?;
         tokio::spawn(connection);
 
@@ -87,8 +96,7 @@ pub fn setup_loopback() -> Result<()> {
 /// Creates the bridge if it doesn't already exist, assigns 10.0.42.1/24,
 /// brings it up, and enables IP forwarding on the host.
 pub fn ensure_bridge() -> Result<()> {
-    let rt = netlink_runtime()?;
-    rt.block_on(async {
+    netlink_block!(async move {
         let (connection, handle, _) = rtnetlink::new_connection()?;
         tokio::spawn(connection);
 
@@ -287,8 +295,10 @@ pub fn setup_container_network(container_id: &str, child_pid: i32) -> Result<Con
     let ip = allocate_ip().context("failed to allocate container IP")?;
 
     // Phase 1: Host-side netlink operations (create veth, attach to bridge, move peer)
-    let rt = netlink_runtime()?;
-    rt.block_on(async {
+    let veth_host2 = veth_host.clone();
+    let veth_peer2 = veth_peer.clone();
+    netlink_block!(async move {
+        let (veth_host, veth_peer) = (veth_host2, veth_peer2);
         let (connection, handle, _) = rtnetlink::new_connection()?;
         tokio::spawn(connection);
 
@@ -404,8 +414,7 @@ fn configure_container_netns(
 /// Configure networking inside the container's network namespace.
 /// Must be called while already in the container's netns.
 fn configure_inside_container_netns(veth_peer: &str, ip: &str, gateway: &str) -> Result<()> {
-    let rt = netlink_runtime()?;
-    rt.block_on(async {
+    netlink_block!(async move {
         let (connection, handle, _) = rtnetlink::new_connection()?;
         tokio::spawn(connection);
 
@@ -519,8 +528,7 @@ pub fn cleanup_container_network(container_id: &str) -> Result<()> {
     let short_id = &container_id[..8];
     let veth_host = format!("veth-{short_id}");
 
-    let rt = netlink_runtime()?;
-    rt.block_on(async {
+    netlink_block!(async move {
         let (connection, handle, _) = rtnetlink::new_connection()?;
         tokio::spawn(connection);
 
@@ -715,14 +723,8 @@ pub fn flush_port_forwarding() {
 
 /// Clean up all stale corten veth interfaces.
 pub fn cleanup_stale_veths() {
-    let rt = match netlink_runtime() {
-        Ok(rt) => rt,
-        Err(_) => return,
-    };
-    rt.block_on(async {
-        let Ok((connection, handle, _)) = rtnetlink::new_connection() else {
-            return;
-        };
+    let _: Result<()> = netlink_block!(async move {
+        let (connection, handle, _) = rtnetlink::new_connection()?;
         tokio::spawn(connection);
 
         let mut links = handle.link().get().execute();
@@ -732,8 +734,6 @@ pub fn cleanup_stale_veths() {
             for nla in &link.attributes {
                 if let netlink_packet_route::link::LinkAttribute::IfName(name) = nla {
                     if name.starts_with("veth-") || name.starts_with("peer-") {
-                        // Check if operstate is down/not-present (NO-CARRIER)
-                        // If the link doesn't have LowerUp flag, it's stale
                         let has_lower_up = link.header.flags.iter().any(|f| {
                             matches!(f, netlink_packet_route::link::LinkFlag::LowerUp)
                         });
@@ -749,6 +749,7 @@ pub fn cleanup_stale_veths() {
             handle.link().del(idx).execute().await.ok();
             log::info!("cleaned up stale veth: {name}");
         }
+        Ok(())
     });
 }
 
@@ -795,8 +796,11 @@ pub fn create_network(name: &str) -> Result<NetworkInfo> {
     let bridge_name = format!("corten-{}", &name[..name.len().min(10)]);
 
     // Create the bridge via netlink
-    let rt = netlink_runtime()?;
-    rt.block_on(async {
+    let nl_bridge = bridge_name.clone();
+    let nl_gateway = gateway.clone();
+    let nl_gateway_cidr = gateway_cidr.clone();
+    netlink_block!(async move {
+        let (bridge_name, gateway, gateway_cidr) = (nl_bridge, nl_gateway, nl_gateway_cidr);
         let (connection, handle, _) = rtnetlink::new_connection()?;
         tokio::spawn(connection);
 
@@ -912,8 +916,7 @@ pub fn remove_network(name: &str) -> Result<()> {
     }
 
     // Delete the bridge via netlink
-    let rt = netlink_runtime()?;
-    rt.block_on(async {
+    netlink_block!(async move {
         let (connection, handle, _) = rtnetlink::new_connection()?;
         tokio::spawn(connection);
 
@@ -1043,8 +1046,12 @@ pub fn setup_container_named_network(
     let veth_peer = format!("peer-{short_id}");
 
     // Create veth pair, attach to bridge, move peer to container netns
-    let rt = netlink_runtime()?;
-    rt.block_on(async {
+    let veth_host2 = veth_host.clone();
+    let veth_peer2 = veth_peer.clone();
+    let info_bridge = info.bridge.clone();
+    netlink_block!(async move {
+        let (veth_host, veth_peer) = (veth_host2, veth_peer2);
+        let info_bridge = info_bridge;
         let (connection, handle, _) = rtnetlink::new_connection()?;
         tokio::spawn(connection);
 
@@ -1058,11 +1065,11 @@ pub fn setup_container_named_network(
             .context("failed to create veth pair")?;
 
         // Get bridge index
-        let mut links = handle.link().get().match_name(info.bridge.clone()).execute();
+        let mut links = handle.link().get().match_name(info_bridge.clone()).execute();
         let bridge = links
             .try_next()
             .await?
-            .ok_or_else(|| anyhow!("bridge {} not found", info.bridge))?;
+            .ok_or_else(|| anyhow!("bridge {} not found", info_bridge))?;
         let bridge_idx = bridge.header.index;
 
         // Attach host veth to bridge and bring up

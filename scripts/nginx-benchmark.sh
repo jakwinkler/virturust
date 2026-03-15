@@ -16,11 +16,6 @@ green()  { echo -e "\033[32m$*\033[0m"; }
 bold()   { echo -e "\033[1m$*\033[0m"; }
 yellow() { echo -e "\033[33m$*\033[0m"; }
 
-if [ "$(id -u)" -ne 0 ]; then
-    red "Must run as root: sudo $0"
-    exit 1
-fi
-
 if [ ! -f "$CORTEN" ]; then
     red "Build first: make build"
     exit 1
