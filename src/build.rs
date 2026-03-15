@@ -26,14 +26,27 @@ fn run_in_chroot_with_env(
     use std::os::unix::process::CommandExt;
 
     let rootfs = rootfs.to_path_buf();
-    let cmd = cmd.to_string();
-    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-    let env: Vec<(String, String)> = env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
 
-    // Use pre_exec to chroot before exec — this runs after fork but before exec
-    let mut command = std::process::Command::new(&cmd);
-    command.args(&args);
-    for (k, v) in &env {
+    // Build the full shell command to run inside chroot.
+    // We exec /bin/sh because Command::new() resolves the binary on the HOST
+    // before pre_exec runs. /bin/sh is guaranteed to exist in the rootfs.
+    let shell_cmd = if args.is_empty() {
+        cmd.to_string()
+    } else {
+        let escaped_args: Vec<String> = args.iter().map(|a| {
+            if a.contains(' ') || a.contains('\'') || a.contains('"') || a.contains('$') || a.contains('\\') || a.contains('*') {
+                format!("'{}'", a.replace('\'', "'\\''"))
+            } else {
+                a.to_string()
+            }
+        }).collect();
+        format!("{cmd} {}", escaped_args.join(" "))
+    };
+
+    let mut command = std::process::Command::new("/bin/sh");
+    command.arg("-c").arg(&shell_cmd);
+    command.env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+    for (k, v) in env {
         command.env(k, v);
     }
     unsafe {
@@ -46,7 +59,7 @@ fn run_in_chroot_with_env(
             Ok(())
         });
     }
-    command.status().with_context(|| format!("failed to run {cmd} in chroot"))
+    command.status().with_context(|| format!("failed to run '{shell_cmd}' in chroot"))
 }
 
 /// Top-level Corten.toml structure.
