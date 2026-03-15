@@ -831,6 +831,7 @@ fn start_network_dns(network_name: &str, info: &NetworkInfo) -> Result<()> {
     // Use --interface + --bind-dynamic to ONLY listen on the bridge interface
     let output = root_cmd("dnsmasq")
         .args([
+            "--conf-file=/dev/null",  // ignore system config
             "--no-resolv",
             "--no-hosts",
             "--bind-dynamic",
@@ -847,6 +848,7 @@ fn start_network_dns(network_name: &str, info: &NetworkInfo) -> Result<()> {
         // Fallback: try with --user=root in case of permission issues
         let output2 = root_cmd("dnsmasq")
             .args([
+                "--conf-file=/dev/null",
                 "--user=root",
                 "--no-resolv",
                 "--no-hosts",
