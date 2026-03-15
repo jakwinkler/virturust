@@ -395,6 +395,11 @@ fn configure_container_netns(
     gateway: &str,
 ) -> Result<()> {
     // Open the container's net namespace
+    // Need to temporarily become root to access /proc/<pid>/ns/net
+    let orig_uid = unsafe { libc::getuid() };
+    let orig_gid = unsafe { libc::getgid() };
+    unsafe { libc::setegid(0); libc::seteuid(0); }
+
     let ns_path = format!("/proc/{child_pid}/ns/net");
     let ns_fd = std::fs::File::open(&ns_path).context("failed to open container net namespace")?;
 
@@ -412,6 +417,9 @@ fn configure_container_netns(
     // Always return to our own namespace, even if configuration failed
     nix::sched::setns(my_ns.as_fd(), nix::sched::CloneFlags::CLONE_NEWNET)
         .context("failed to return to host namespace")?;
+
+    // Restore original uid/gid
+    unsafe { libc::seteuid(orig_uid); libc::setegid(orig_gid); }
 
     result
 }
