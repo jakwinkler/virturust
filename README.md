@@ -26,6 +26,7 @@ Corten does none of that:
 | **Binary size**     | 179 MB (cli+dockerd+containerd)             | **8.5 MB**                    |
 | **Image source**    | Docker Hub                                  | **Official distro mirrors**   |
 | **User isolation**  | Shared namespace                            | **Per-user containers**       |
+| **Volume limits**   | No size limit                               | **Sized volumes + resize**    |
 | **Config format**   | Dockerfile (imperative)                     | **Corten.toml (declarative)** |
 
 ## Benchmarks
@@ -405,6 +406,53 @@ corten run -d --name api --network backend my-api
 corten run -d --name db  --network backend my-db
 # api can reach db by name: ping db
 ```
+
+## Volumes — With Size Limits and Resize
+
+Docker volumes have no size limit. A runaway container can fill your entire disk. Corten fixes this:
+
+```bash
+# Regular volume (no limit, like Docker)
+corten volume create logs
+corten run -v logs:/var/log my-app
+
+# Sized volume — 500MB max, enforced by the kernel
+corten volume create dbdata --size 500m
+corten run -v dbdata:/var/lib/mysql my-mysql
+# Writes beyond 500MB → ENOSPC (disk full) — container can't fill your disk
+
+# Need more space? Resize live — Docker can't do this
+corten volume resize dbdata 1g
+
+# Need to save disk? Shrink it
+corten volume resize dbdata 250m
+
+# Check usage
+corten volume inspect dbdata
+```
+
+```
+Name:      dbdata
+Type:      sized (loopback ext4)
+Limit:     500.0 MB
+Used:      123.4 MB
+Available: 376.6 MB
+```
+
+### How Sized Volumes Work
+
+Sparse loopback ext4 files — the kernel enforces the limit:
+- `--size 500m` creates a 500MB sparse file (no disk until written)
+- Formatted as ext4, mounted via loop device
+- `resize2fs` handles live grow/shrink
+- Per-user isolation (volumes scoped to user)
+
+| | Docker | Corten |
+|---|---|---|
+| **Volume size limit** | Not supported | `--size 500m` |
+| **Resize volume** | Not supported | `corten volume resize` |
+| **Usage tracking** | Basic | Used / limit / available |
+| **Per-user isolation** | No | Yes |
 
 ## Security
 
