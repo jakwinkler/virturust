@@ -1,1 +1,8 @@
 /target
+*.discussion.md
+chatgpt.*
+discussion.md
+compose.md
+ideas.md
+benchmark-results.txt
+.claude/
