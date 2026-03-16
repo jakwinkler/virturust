@@ -80,6 +80,7 @@ async fn main() -> Result<()> {
         Commands::Kill(args) => cmd_kill(args)?,
         Commands::Cp(args) => cmd_cp(args)?,
         Commands::Forge(args) => cmd_forge(args).await?,
+        Commands::Volume(args) => cmd_volume(args)?,
     }
 
     Ok(())
@@ -871,6 +872,104 @@ fn copy_dir_for_cp(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
 }
 
 /// Remove stopped containers and unused images.
+/// Execute the `volume` subcommand — manage named volumes.
+fn cmd_volume(args: corten::cli::VolumeSubArgs) -> Result<()> {
+    use corten::cli::VolumeCommands;
+    let vdir = config::volumes_dir();
+
+    match args.command {
+        VolumeCommands::Create(a) => {
+            let vol_path = vdir.join(&a.name);
+            if vol_path.exists() {
+                return Err(anyhow!("volume '{}' already exists", a.name));
+            }
+            std::fs::create_dir_all(&vol_path)
+                .with_context(|| format!("failed to create volume '{}'", a.name))?;
+            println!("Created volume: {}", a.name);
+        }
+        VolumeCommands::Ls => {
+            println!("{:<20} {:<15} {}", "NAME", "SIZE", "PATH");
+            println!("{}", "-".repeat(60));
+            if vdir.exists() {
+                for entry in std::fs::read_dir(&vdir)? {
+                    let entry = entry?;
+                    if entry.file_type()?.is_dir() {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        // Calculate size
+                        let size = dir_size(&entry.path());
+                        let size_str = if size > 1024 * 1024 {
+                            format!("{:.1} MB", size as f64 / 1024.0 / 1024.0)
+                        } else if size > 1024 {
+                            format!("{:.1} KB", size as f64 / 1024.0)
+                        } else {
+                            format!("{} B", size)
+                        };
+                        println!("{:<20} {:<15} {}", name, size_str, entry.path().display());
+                    }
+                }
+            }
+        }
+        VolumeCommands::Inspect(a) => {
+            let vol_path = vdir.join(&a.name);
+            if !vol_path.exists() {
+                return Err(anyhow!("volume '{}' not found", a.name));
+            }
+            let size = dir_size(&vol_path);
+            println!("Name:    {}", a.name);
+            println!("Path:    {}", vol_path.display());
+            println!("Size:    {} bytes ({:.1} MB)", size, size as f64 / 1024.0 / 1024.0);
+            // Count files
+            let count = std::fs::read_dir(&vol_path)
+                .map(|entries| entries.count())
+                .unwrap_or(0);
+            println!("Files:   {}", count);
+        }
+        VolumeCommands::Rm(a) => {
+            let vol_path = vdir.join(&a.name);
+            if !vol_path.exists() {
+                return Err(anyhow!("volume '{}' not found", a.name));
+            }
+            std::fs::remove_dir_all(&vol_path)
+                .with_context(|| format!("failed to remove volume '{}'", a.name))?;
+            println!("Removed volume: {}", a.name);
+        }
+        VolumeCommands::Prune => {
+            if !vdir.exists() {
+                println!("No volumes to prune.");
+                return Ok(());
+            }
+            let mut removed = 0;
+            for entry in std::fs::read_dir(&vdir)? {
+                let entry = entry?;
+                if entry.file_type()?.is_dir() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    std::fs::remove_dir_all(entry.path()).ok();
+                    println!("Removed: {}", name);
+                    removed += 1;
+                }
+            }
+            println!("Removed {} volume(s).", removed);
+        }
+    }
+    Ok(())
+}
+
+fn dir_size(path: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            if let Ok(meta) = entry.metadata() {
+                if meta.is_file() {
+                    total += meta.len();
+                } else if meta.is_dir() {
+                    total += dir_size(&entry.path());
+                }
+            }
+        }
+    }
+    total
+}
+
 fn cmd_system_prune() -> Result<()> {
     let containers_dir = config::containers_dir();
     let mut removed_containers = 0;

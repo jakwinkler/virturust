@@ -4,7 +4,7 @@
 //! configuration and resource limits, along with helper functions
 //! for parsing human-readable values from CLI arguments.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -229,6 +229,17 @@ fn user_dir() -> PathBuf {
     data_dir().join("users").join(uid)
 }
 
+/// Directory where named volumes are stored (per-user).
+/// Layout: `<volumes_dir>/<volume-name>/`
+pub fn volumes_dir() -> PathBuf {
+    let uid = std::env::var("CORTEN_REAL_UID").unwrap_or_else(|_| "0".to_string());
+    if uid == "0" {
+        data_dir().join("volumes")
+    } else {
+        data_dir().join("users").join(uid).join("volumes")
+    }
+}
+
 /// Directory where pulled images are stored (shared across all users).
 /// Layout: `<images_dir>/<name>/<tag>/rootfs/`
 pub fn images_dir() -> PathBuf {
@@ -345,14 +356,31 @@ pub fn parse_volume(s: &str) -> Result<VolumeMount> {
         )),
     };
 
-    let host = Path::new(host_path);
     let container = Path::new(container_path);
+
+    if !container.is_absolute() {
+        return Err(anyhow!("container path must be absolute: '{container_path}'"));
+    }
+
+    // Named volume: if host_path doesn't start with / or ., it's a volume name
+    let host_path = if !host_path.starts_with('/') && !host_path.starts_with('.') {
+        // Named volume — resolve to /var/lib/corten/volumes/<name>/
+        let vol_dir = volumes_dir().join(host_path);
+        if !vol_dir.exists() {
+            // Auto-create the volume
+            std::fs::create_dir_all(&vol_dir)
+                .with_context(|| format!("failed to create volume '{host_path}'"))?;
+            log::info!("auto-created volume '{host_path}'");
+        }
+        vol_dir.to_string_lossy().to_string()
+    } else {
+        host_path.to_string()
+    };
+
+    let host = Path::new(&host_path);
 
     if !host.is_absolute() {
         return Err(anyhow!("host path must be absolute: '{host_path}'"));
-    }
-    if !container.is_absolute() {
-        return Err(anyhow!("container path must be absolute: '{container_path}'"));
     }
 
     Ok(VolumeMount {
@@ -477,8 +505,13 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_volume_relative_host_fails() {
-        assert!(parse_volume("relative:/app").is_err());
+    fn test_parse_volume_named_volume() {
+        // "mydata:/app" should be treated as a named volume (auto-created)
+        let vol = parse_volume("mydata:/app").unwrap();
+        assert!(vol.host_path.to_string_lossy().contains("volumes/mydata"));
+        assert_eq!(vol.container_path.to_string_lossy(), "/app");
+        // Clean up the auto-created volume
+        std::fs::remove_dir_all(vol.host_path).ok();
     }
 
     #[test]

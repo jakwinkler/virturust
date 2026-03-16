@@ -72,6 +72,47 @@ pub enum Commands {
 
     /// Forge — multi-container orchestration from TOML
     Forge(ComposeArgs),
+
+    /// Manage named volumes
+    Volume(VolumeSubArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct VolumeSubArgs {
+    #[command(subcommand)]
+    pub command: VolumeCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum VolumeCommands {
+    /// Create a named volume
+    Create(VolumeCreateArgs),
+    /// List volumes
+    Ls,
+    /// Remove a volume
+    Rm(VolumeRmArgs),
+    /// Inspect a volume
+    Inspect(VolumeInspectArgs),
+    /// Remove unused volumes
+    Prune,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct VolumeCreateArgs {
+    /// Volume name
+    pub name: String,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct VolumeRmArgs {
+    /// Volume name
+    pub name: String,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct VolumeInspectArgs {
+    /// Volume name
+    pub name: String,
 }
 
 #[derive(clap::Args, Debug)]

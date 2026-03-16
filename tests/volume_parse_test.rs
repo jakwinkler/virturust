@@ -41,8 +41,11 @@ fn parse_volume_root_paths() {
 }
 
 #[test]
-fn parse_volume_relative_host_path_fails() {
-    assert!(parse_volume("relative:/container").is_err());
+fn parse_volume_named_volume_resolves() {
+    // "myvolume:/container" is now a named volume, not a relative path error
+    let vol = parse_volume("testvolume123:/container").unwrap();
+    assert!(vol.host_path.to_string_lossy().contains("volumes/testvolume123"));
+    std::fs::remove_dir_all(vol.host_path).ok();
 }
 
 #[test]
