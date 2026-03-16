@@ -228,6 +228,14 @@ pub struct RunArgs {
     #[arg(short = 'd', long)]
     pub detach: bool,
 
+    /// Keep STDIN open (for interactive containers)
+    #[arg(short = 'i', long = "interactive")]
+    pub interactive: bool,
+
+    /// Allocate a pseudo-TTY
+    #[arg(short = 't', long = "tty")]
+    pub tty: bool,
+
     /// Restart policy: no (default), always, on-failure[:max-retries]
     #[arg(long, default_value = "no")]
     pub restart: String,

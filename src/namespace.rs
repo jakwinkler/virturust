@@ -66,6 +66,9 @@ pub struct ChildArgs {
 
     /// Mount root filesystem as read-only
     pub read_only: bool,
+
+    /// PTY slave fd — if set, attach to this as stdin/stdout/stderr
+    pub pty_slave_fd: Option<i32>,
 }
 
 /// Entry point for the cloned child process.
@@ -226,9 +229,21 @@ fn child_main(args: &ChildArgs) -> Result<()> {
         .chain(std::iter::once(std::ptr::null()))
         .collect();
 
-    // Redirect stdout/stderr to log file right before exec
-    // (all setup logging is done, only container output goes to the file)
-    if let Some(fd) = log_fd {
+    // Attach PTY slave as stdin/stdout/stderr (for -it mode)
+    if let Some(slave_fd) = args.pty_slave_fd {
+        unsafe {
+            // Create new session and set controlling terminal
+            libc::setsid();
+            libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0);
+            libc::dup2(slave_fd, 0); // stdin
+            libc::dup2(slave_fd, 1); // stdout
+            libc::dup2(slave_fd, 2); // stderr
+            if slave_fd > 2 {
+                libc::close(slave_fd);
+            }
+        }
+    } else if let Some(fd) = log_fd {
+        // Redirect stdout/stderr to log file (detach mode)
         unsafe {
             libc::dup2(fd, 1); // stdout
             libc::dup2(fd, 2); // stderr

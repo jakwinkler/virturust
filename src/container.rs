@@ -129,6 +129,11 @@ pub fn is_process_alive(pid: i32) -> bool {
 /// The container process's exit code (0 = success, non-zero = error,
 /// 128+N = killed by signal N).
 pub fn run(config: &ContainerConfig, detach: bool) -> Result<i32> {
+    run_with_tty(config, detach, false, false)
+}
+
+/// Run a container with optional TTY and interactive mode.
+pub fn run_with_tty(config: &ContainerConfig, detach: bool, tty: bool, interactive: bool) -> Result<i32> {
     log::info!(
         "starting container '{}' (id={}, image={})",
         config.name,
@@ -254,6 +259,36 @@ pub fn run(config: &ContainerConfig, detach: bool) -> Result<i32> {
         }
         let (pipe_rd, pipe_wr) = (fds[0], fds[1]);
 
+        // Create PTY pair for interactive mode
+        let (pty_master, pty_slave) = if tty {
+            let master = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
+            if master < 0 {
+                return Err(anyhow!("posix_openpt failed: {}", std::io::Error::last_os_error()));
+            }
+            unsafe {
+                libc::grantpt(master);
+                libc::unlockpt(master);
+            }
+            let slave_name = unsafe {
+                let ptr = libc::ptsname(master);
+                std::ffi::CStr::from_ptr(ptr).to_string_lossy().to_string()
+            };
+            let slave_cstr = std::ffi::CString::new(slave_name.as_str()).unwrap();
+            let slave = unsafe { libc::open(slave_cstr.as_ptr(), libc::O_RDWR) };
+            if slave < 0 {
+                return Err(anyhow!("failed to open PTY slave: {}", std::io::Error::last_os_error()));
+            }
+            // Set terminal size from current terminal
+            if unsafe { libc::isatty(0) } == 1 {
+                let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+                unsafe { libc::ioctl(0, libc::TIOCGWINSZ, &mut ws) };
+                unsafe { libc::ioctl(slave, libc::TIOCSWINSZ, &ws) };
+            }
+            (Some(master), Some(slave))
+        } else {
+            (None, None)
+        };
+
         // Create the container process in new namespaces
         let child_args = ChildArgs {
             rootfs: container_rootfs.to_string_lossy().to_string(),
@@ -278,12 +313,16 @@ pub fn run(config: &ContainerConfig, detach: bool) -> Result<i32> {
             rootless: config.rootless,
             privileged: config.privileged,
             read_only: config.read_only,
+            pty_slave_fd: pty_slave,
         };
 
         let child_pid = create_namespaced_process(child_args)?;
 
-        // Close read end in parent
+        // Close read end in parent, and slave PTY (child has it)
         unsafe { libc::close(pipe_rd) };
+        if let Some(slave) = pty_slave {
+            unsafe { libc::close(slave) };
+        }
 
         // Add child to cgroup before it starts doing work
         if let Some(ref cg) = cgroup {
@@ -372,11 +411,22 @@ pub fn run(config: &ContainerConfig, detach: bool) -> Result<i32> {
             println!("Container '{}' started (PID {})", config.name, child_pid);
         }
 
+        // In TTY mode: forward I/O between host terminal and PTY master
+        // This runs until the child exits (waitpid in a separate thread)
+        if let Some(master_fd) = pty_master {
+            pty_forward(master_fd, child_pid, interactive)?;
+        }
+
         // Wait for the container process to exit (foreground or monitor)
         let mut wait_status: libc::c_int = 0;
-        let ret = unsafe { libc::waitpid(child_pid, &mut wait_status, 0) };
-        if ret == -1 {
-            log::error!("waitpid failed: {}", std::io::Error::last_os_error());
+        if pty_master.is_some() {
+            // Already waited in pty_forward
+            unsafe { libc::waitpid(child_pid, &mut wait_status, libc::WNOHANG) };
+        } else {
+            let ret = unsafe { libc::waitpid(child_pid, &mut wait_status, 0) };
+            if ret == -1 {
+                log::error!("waitpid failed: {}", std::io::Error::last_os_error());
+            }
         }
 
         let exit_code = if libc::WIFEXITED(wait_status) {
@@ -448,6 +498,107 @@ pub fn run(config: &ContainerConfig, detach: bool) -> Result<i32> {
         config.name
     );
     Ok(final_exit_code)
+}
+
+/// Forward I/O between host terminal and container PTY.
+///
+/// Sets the host terminal to raw mode, then uses poll() to multiplex:
+/// - Host stdin → PTY master (user typing)
+/// - PTY master → Host stdout (container output)
+///
+/// Exits when the child process dies or PTY closes.
+fn pty_forward(master_fd: i32, child_pid: i32, interactive: bool) -> Result<()> {
+    use std::io::{Read, Write};
+
+    // Save original terminal settings and switch to raw mode
+    let mut orig_termios: libc::termios = unsafe { std::mem::zeroed() };
+    let is_tty = unsafe { libc::isatty(0) } == 1;
+
+    if is_tty {
+        unsafe { libc::tcgetattr(0, &mut orig_termios) };
+        let mut raw = orig_termios;
+        unsafe { libc::cfmakeraw(&mut raw) };
+        unsafe { libc::tcsetattr(0, libc::TCSANOW, &raw) };
+    }
+
+    // Ensure we restore terminal on exit
+    let _guard = scopeguard(is_tty, orig_termios);
+
+    // Poll loop: forward between stdin ↔ master
+    let mut buf = [0u8; 4096];
+    loop {
+        let mut fds = [
+            libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 },         // stdin
+            libc::pollfd { fd: master_fd, events: libc::POLLIN, revents: 0 },  // pty master
+        ];
+
+        let nfds = if interactive { 2 } else { 1 };
+        let poll_fds = if interactive { &mut fds[..2] } else { &mut fds[1..2] };
+
+        let ret = unsafe { libc::poll(poll_fds.as_mut_ptr(), poll_fds.len() as _, 100) };
+        if ret < 0 {
+            break;
+        }
+
+        // Check if child is still alive
+        let mut status = 0i32;
+        let w = unsafe { libc::waitpid(child_pid, &mut status, libc::WNOHANG) };
+        if w > 0 {
+            // Child exited — drain remaining output from PTY
+            loop {
+                let n = unsafe { libc::read(master_fd, buf.as_mut_ptr() as _, buf.len()) };
+                if n <= 0 { break; }
+                std::io::stdout().write_all(&buf[..n as usize]).ok();
+            }
+            std::io::stdout().flush().ok();
+            break;
+        }
+
+        if interactive {
+            // stdin → master (user typing)
+            if fds[0].revents & libc::POLLIN != 0 {
+                let n = unsafe { libc::read(0, buf.as_mut_ptr() as _, buf.len()) };
+                if n <= 0 { break; }
+                unsafe { libc::write(master_fd, buf.as_ptr() as _, n as _) };
+            }
+            // master → stdout (container output)
+            if fds[1].revents & libc::POLLIN != 0 {
+                let n = unsafe { libc::read(master_fd, buf.as_mut_ptr() as _, buf.len()) };
+                if n <= 0 { break; }
+                std::io::stdout().write_all(&buf[..n as usize]).ok();
+                std::io::stdout().flush().ok();
+            }
+        } else {
+            // TTY but not interactive: just forward output
+            if poll_fds[0].revents & libc::POLLIN != 0 {
+                let n = unsafe { libc::read(master_fd, buf.as_mut_ptr() as _, buf.len()) };
+                if n <= 0 { break; }
+                std::io::stdout().write_all(&buf[..n as usize]).ok();
+                std::io::stdout().flush().ok();
+            }
+        }
+    }
+
+    unsafe { libc::close(master_fd) };
+    Ok(())
+}
+
+/// RAII guard to restore terminal settings on drop.
+struct TermGuard {
+    is_tty: bool,
+    termios: libc::termios,
+}
+
+impl Drop for TermGuard {
+    fn drop(&mut self) {
+        if self.is_tty {
+            unsafe { libc::tcsetattr(0, libc::TCSANOW, &self.termios) };
+        }
+    }
+}
+
+fn scopeguard(is_tty: bool, termios: libc::termios) -> TermGuard {
+    TermGuard { is_tty, termios }
 }
 
 /// Set up UID/GID mappings for rootless containers.

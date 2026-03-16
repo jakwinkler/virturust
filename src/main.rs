@@ -151,6 +151,8 @@ async fn cmd_run(args: corten::cli::RunArgs) -> Result<()> {
     }
 
     let detach = args.detach;
+    let tty = args.tty;
+    let interactive = args.interactive;
     let (name, tag) = parse_image_ref(&args.image);
 
     // Auto-pull if the image isn't available locally
@@ -245,7 +247,7 @@ async fn cmd_run(args: corten::cli::RunArgs) -> Result<()> {
         auto_remove: args.rm,
     };
 
-    let exit_code = container::run(&config, detach)?;
+    let exit_code = container::run_with_tty(&config, detach, tty, interactive)?;
     if !detach {
         std::process::exit(exit_code);
     }
