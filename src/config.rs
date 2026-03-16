@@ -219,16 +219,35 @@ pub fn data_dir() -> PathBuf {
     }
 }
 
-/// Directory where pulled images are stored.
+/// Per-user data directory for container isolation.
+///
+/// Each user gets their own container space at `/var/lib/corten/users/<uid>/`.
+/// Images are shared (read-only), but containers are per-user.
+/// This means User A cannot see, stop, or exec into User B's containers.
+fn user_dir() -> PathBuf {
+    let uid = std::env::var("CORTEN_REAL_UID").unwrap_or_else(|_| "0".to_string());
+    data_dir().join("users").join(uid)
+}
+
+/// Directory where pulled images are stored (shared across all users).
 /// Layout: `<images_dir>/<name>/<tag>/rootfs/`
 pub fn images_dir() -> PathBuf {
     data_dir().join("images")
 }
 
-/// Directory where container state is stored.
+/// Directory where container state is stored (per-user).
 /// Layout: `<containers_dir>/<container-id>/config.json`
+///
+/// Each user only sees their own containers. This is enforced by
+/// storing containers under `/var/lib/corten/users/<uid>/containers/`.
 pub fn containers_dir() -> PathBuf {
-    data_dir().join("containers")
+    let uid = std::env::var("CORTEN_REAL_UID").unwrap_or_else(|_| "0".to_string());
+    if uid == "0" {
+        // Root sees all containers in the legacy location
+        data_dir().join("containers")
+    } else {
+        user_dir().join("containers")
+    }
 }
 
 /// Parse a human-readable memory string into bytes.

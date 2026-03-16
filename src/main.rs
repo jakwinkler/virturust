@@ -18,17 +18,41 @@ use corten::image;
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // Save the real user who invoked corten (before privilege elevation).
+    // Used for per-user container isolation.
+    let real_uid = unsafe { libc::getuid() };
+    let real_gid = unsafe { libc::getgid() };
+
+    // Check if user is in the 'corten' group (or is root).
+    // If the 'corten' group exists, only members can use corten.
+    // If it doesn't exist, anyone can use it (backwards compatible).
+    if real_uid != 0 {
+        if let Some(required_gid) = corten_group_gid() {
+            if !user_in_group(real_uid, required_gid) {
+                eprintln!("Permission denied: user is not in the 'corten' group.");
+                eprintln!("");
+                eprintln!("Add yourself:  sudo usermod -aG corten $(whoami)");
+                eprintln!("Then log out and back in.");
+                std::process::exit(1);
+            }
+        }
+    }
+
     // Elevate to root if we have CAP_SETUID (from make install).
     // This allows all child processes (ip, iptables, nsenter, chroot)
     // and netlink operations to work without sudo.
-    // Use setresuid/setresgid to set real, effective, and saved UIDs.
     unsafe {
         let r1 = libc::setresgid(0, 0, 0);
         let r2 = libc::setresuid(0, 0, 0);
         if r1 != 0 || r2 != 0 {
-            // Not fatal — we might be running without capabilities (dev mode)
             log::debug!("setresuid(0) failed — running without root elevation");
         }
+    }
+
+    // Store real UID for per-user container isolation
+    unsafe {
+        std::env::set_var("CORTEN_REAL_UID", real_uid.to_string());
+        std::env::set_var("CORTEN_REAL_GID", real_gid.to_string());
     }
 
     // Configure logging — default to "info", use "debug" with --verbose
@@ -65,6 +89,45 @@ async fn main() -> Result<()> {
 /// Accepts either root (sudo) or Linux capabilities set via `setcap`.
 /// After `make install`, capabilities are set on the binary so sudo
 /// is not required.
+/// Get the GID of the 'corten' group, if it exists.
+fn corten_group_gid() -> Option<u32> {
+    use std::ffi::CStr;
+    let name = std::ffi::CString::new("corten").ok()?;
+    let grp = unsafe { libc::getgrnam(name.as_ptr()) };
+    if grp.is_null() {
+        None // Group doesn't exist — no restriction
+    } else {
+        Some(unsafe { (*grp).gr_gid })
+    }
+}
+
+/// Check if a user is in a specific group.
+fn user_in_group(uid: u32, target_gid: u32) -> bool {
+    // Check primary group
+    let pw = unsafe { libc::getpwuid(uid) };
+    if !pw.is_null() && unsafe { (*pw).pw_gid } == target_gid {
+        return true;
+    }
+
+    // Check supplementary groups
+    let mut ngroups: libc::c_int = 64;
+    let mut groups = vec![0u32; ngroups as usize];
+    if !pw.is_null() {
+        let username = unsafe { (*pw).pw_name };
+        unsafe {
+            libc::getgrouplist(
+                username,
+                (*pw).pw_gid as libc::gid_t,
+                groups.as_mut_ptr() as *mut libc::gid_t,
+                &mut ngroups,
+            );
+        }
+        groups.truncate(ngroups as usize);
+        return groups.contains(&target_gid);
+    }
+    false
+}
+
 fn require_privileges() -> Result<()> {
     if has_cap_sys_admin() {
         return Ok(());

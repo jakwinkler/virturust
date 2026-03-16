@@ -59,6 +59,12 @@ install: build
 	$(ELEVATE) chown $$(id -u):$$(id -g) /sys/fs/cgroup/corten
 	@echo "+memory +cpu +pids" | $(ELEVATE) tee /sys/fs/cgroup/cgroup.subtree_control > /dev/null 2>&1 || true
 	@echo ""
+	@echo "5. Creating 'corten' group (optional, for multi-user security)..."
+	$(ELEVATE) groupadd -f corten 2>/dev/null || true
+	$(ELEVATE) usermod -aG corten $$(whoami) 2>/dev/null || true
+	$(ELEVATE) mkdir -p /var/lib/corten/users
+	$(ELEVATE) chmod 755 /var/lib/corten/users
+	@echo ""
 	@echo "=== Installation complete! ==="
 	@echo ""
 	@echo "You can now run corten WITHOUT sudo:"
