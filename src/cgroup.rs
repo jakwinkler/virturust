@@ -42,12 +42,16 @@ impl Cgroup {
     /// Creates the directory at `/sys/fs/cgroup/corten/<id>/`.
     /// The parent `corten` directory is also created if it doesn't exist.
     pub fn create(container_id: &str) -> Result<Self> {
-        let path = PathBuf::from(CGROUP_ROOT)
-            .join(CORTEN_CGROUP)
-            .join(container_id);
+        let corten_cgroup = PathBuf::from(CGROUP_ROOT).join(CORTEN_CGROUP);
+        let path = corten_cgroup.join(container_id);
 
         fs::create_dir_all(&path)
             .with_context(|| format!("failed to create cgroup at {}", path.display()))?;
+
+        // Enable controllers (memory, cpu, pids) on the corten parent cgroup
+        // so child cgroups can use memory.max, cpu.max, pids.max
+        let subtree_control = corten_cgroup.join("cgroup.subtree_control");
+        fs::write(&subtree_control, "+memory +cpu +pids").ok();
 
         log::info!("created cgroup at {}", path.display());
         Ok(Self { path })
