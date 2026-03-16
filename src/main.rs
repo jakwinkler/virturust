@@ -56,8 +56,9 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Configure logging — default to "info", use "debug" with --verbose
-    let log_level = if cli.verbose { "debug" } else { "info" };
+    // Configure logging — suppress in interactive TTY mode for clean output
+    let is_tty_mode = matches!(&cli.command, Commands::Run(args) if args.tty);
+    let log_level = if cli.verbose { "debug" } else if is_tty_mode { "warn" } else { "info" };
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level))
         .format_timestamp(None)
         .init();
