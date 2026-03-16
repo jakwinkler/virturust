@@ -126,8 +126,8 @@ echo ""
 
 DOCKER_IMG=$(docker image inspect alpine:3.20 --format '{{.Size}}' 2>/dev/null || echo "0")
 DOCKER_IMG_MB=$((DOCKER_IMG / 1024 / 1024))
-CORTEN_IMG=$(du -sb /var/lib/corten/images/alpine/latest/rootfs 2>/dev/null | cut -f1 || echo "0")
-CORTEN_IMG_MB=$((CORTEN_IMG / 1024 / 1024))
+CORTEN_IMG=$(du -sb /var/lib/corten/images/alpine/latest/rootfs 2>/dev/null | cut -f1)
+CORTEN_IMG_MB=$((${CORTEN_IMG:-0} / 1024 / 1024))
 
 echo "  Docker Alpine:  ${DOCKER_IMG_MB} MB"
 echo "  Corten Alpine:  ${CORTEN_IMG_MB} MB"
