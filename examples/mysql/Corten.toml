@@ -29,3 +29,7 @@ run = [
 command = ["mysqld", "--user=mysql", "--datadir=/var/lib/mysql"]
 user = "mysql"
 expose = [3306]
+
+[logs]
+files = ["/var/log/mysql/error.log"]
+dirs = ["/var/log/mysql/"]

@@ -113,6 +113,19 @@ pub struct BuildConfig {
     pub setup: Option<SetupSection>,
     /// Container runtime defaults
     pub container: Option<ContainerSection>,
+    /// Log sources for `corten mlogs`
+    pub logs: Option<LogsSection>,
+}
+
+/// Log sources definition for multi-log tailing.
+#[derive(Debug, Deserialize, serde::Serialize, Clone)]
+pub struct LogsSection {
+    /// Specific log files to watch
+    #[serde(default)]
+    pub files: Vec<String>,
+    /// Directories to watch (all files inside)
+    #[serde(default)]
+    pub dirs: Vec<String>,
 }
 
 /// Image metadata.
@@ -391,6 +404,8 @@ pub async fn build_image(config: &BuildConfig, toml_dir: &Path) -> Result<std::p
             .as_ref()
             .and_then(|c| c.user.clone())
             .unwrap_or_default(),
+        log_files: config.logs.as_ref().map(|l| l.files.clone()).unwrap_or_default(),
+        log_dirs: config.logs.as_ref().map(|l| l.dirs.clone()).unwrap_or_default(),
     };
     let config_json = serde_json::to_string_pretty(&img_config)?;
     std::fs::write(image_dir.join("config.json"), config_json)

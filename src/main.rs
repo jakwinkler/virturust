@@ -82,6 +82,7 @@ async fn main() -> Result<()> {
         Commands::Cp(args) => cmd_cp(args)?,
         Commands::Forge(args) => cmd_forge(args).await?,
         Commands::Volume(args) => cmd_volume(args)?,
+        Commands::Mlogs(args) => cmd_mlogs(args)?,
     }
 
     Ok(())
@@ -1123,6 +1124,201 @@ fn cmd_volume(args: corten::cli::VolumeSubArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Multi-log tail — watch multiple log files across containers.
+///
+/// Reads log sources from image config ([logs] section in Corten.toml)
+/// plus any additional --file/--dir flags. Tails all files with colored labels.
+fn cmd_mlogs(args: corten::cli::MlogsArgs) -> Result<()> {
+    use std::io::{BufRead, BufReader, Seek, SeekFrom};
+    use std::collections::HashMap;
+
+    // ANSI colors for different log sources
+    const COLORS: &[&str] = &[
+        "\x1b[36m", // cyan
+        "\x1b[33m", // yellow
+        "\x1b[32m", // green
+        "\x1b[35m", // magenta
+        "\x1b[34m", // blue
+        "\x1b[91m", // bright red
+        "\x1b[92m", // bright green
+        "\x1b[93m", // bright yellow
+        "\x1b[94m", // bright blue
+        "\x1b[95m", // bright magenta
+    ];
+    let reset = "\x1b[0m";
+
+    // Collect all log files to watch: (label, host_path)
+    let mut watch_files: Vec<(String, std::path::PathBuf)> = Vec::new();
+    let mut color_idx = 0;
+
+    for container_name in &args.containers {
+        let container_dir = container::find_container(container_name)?;
+        let cfg = container::load_config(&container_dir)?;
+
+        // Find container rootfs (overlay merged or copy)
+        let overlay_merged = container_dir.join("overlay").join("merged");
+        let rootfs_copy = container_dir.join("rootfs");
+        let rootfs = if overlay_merged.exists() {
+            overlay_merged
+        } else if rootfs_copy.exists() {
+            rootfs_copy
+        } else {
+            cfg.rootfs.clone()
+        };
+
+        // Load image config for log sources
+        let (img_name, img_tag) = parse_image_ref(&cfg.image);
+        let img_config = image::load_image_config(img_name, img_tag);
+
+        // Add stdout/stderr log (detached mode logs)
+        let stdout_log = container_dir.join("stdout.log");
+        if stdout_log.exists() {
+            watch_files.push((format!("{}:stdout", container_name), stdout_log));
+        }
+
+        // Add log files from image config
+        for log_file in &img_config.log_files {
+            let host_path = rootfs.join(log_file.trim_start_matches('/'));
+            let label = format!("{}:{}", container_name,
+                std::path::Path::new(log_file).file_stem()
+                    .and_then(|s| s.to_str()).unwrap_or("log"));
+            watch_files.push((label, host_path));
+        }
+
+        // Add log directories from image config
+        for log_dir in &img_config.log_dirs {
+            let host_dir = rootfs.join(log_dir.trim_start_matches('/'));
+            if host_dir.exists() {
+                collect_log_files(&host_dir, container_name, &mut watch_files);
+            }
+        }
+
+        // Add extra --file flags
+        for f in &args.files {
+            let host_path = rootfs.join(f.trim_start_matches('/'));
+            let label = format!("{}:{}", container_name,
+                std::path::Path::new(f).file_stem()
+                    .and_then(|s| s.to_str()).unwrap_or("log"));
+            watch_files.push((label, host_path));
+        }
+
+        // Add extra --dir flags
+        for d in &args.dirs {
+            let host_dir = rootfs.join(d.trim_start_matches('/'));
+            if host_dir.exists() {
+                collect_log_files(&host_dir, container_name, &mut watch_files);
+            }
+        }
+    }
+
+    if watch_files.is_empty() {
+        println!("No log files found. Define log sources in Corten.toml:");
+        println!("");
+        println!("  [logs]");
+        println!("  files = [\"/var/log/nginx/access.log\", \"/var/log/nginx/error.log\"]");
+        println!("  dirs = [\"/var/log/php/\"]");
+        println!("");
+        println!("Or specify at runtime:");
+        println!("  corten mlogs myapp --file /var/log/nginx/error.log");
+        return Ok(());
+    }
+
+    // Print header
+    println!("Watching {} log file(s):", watch_files.len());
+    for (i, (label, path)) in watch_files.iter().enumerate() {
+        let color = COLORS[i % COLORS.len()];
+        let exists = if path.exists() { "ok" } else { "not found" };
+        println!("  {color}{label}{reset} → {} ({exists})", path.display());
+    }
+    println!("---");
+
+    // Open files and seek to tail position
+    let mut readers: Vec<(String, &str, std::fs::File, u64)> = Vec::new();
+    for (i, (label, path)) in watch_files.iter().enumerate() {
+        if !path.exists() { continue; }
+        let color = COLORS[i % COLORS.len()];
+        if let Ok(mut f) = std::fs::File::open(path) {
+            // Show last N lines initially
+            let metadata = f.metadata()?;
+            let file_size = metadata.len();
+
+            // Seek to approximate tail position
+            if file_size > 0 {
+                let tail_bytes = std::cmp::min(file_size, (args.tail * 200) as u64);
+                f.seek(SeekFrom::End(-(tail_bytes as i64))).ok();
+                let reader = BufReader::new(f.try_clone()?);
+                let lines: Vec<String> = reader.lines().filter_map(|l| l.ok()).collect();
+                let start = if lines.len() > args.tail { lines.len() - args.tail } else { 0 };
+                for line in &lines[start..] {
+                    if let Some(ref pattern) = args.grep {
+                        if !line.contains(pattern.as_str()) { continue; }
+                    }
+                    println!("{color}[{label}]{reset} {line}");
+                }
+                f.seek(SeekFrom::End(0)).ok();
+            }
+
+            readers.push((label.clone(), color, f, file_size));
+        }
+    }
+
+    // Tail loop — check for new data every 200ms
+    println!("--- tailing (Ctrl+C to stop) ---");
+    loop {
+        let mut any_output = false;
+        for (label, color, f, last_pos) in &mut readers {
+            let current_pos = f.metadata().map(|m| m.len()).unwrap_or(*last_pos);
+            if current_pos > *last_pos {
+                f.seek(SeekFrom::Start(*last_pos)).ok();
+                let reader = BufReader::new(f.try_clone().unwrap());
+                for line in reader.lines().filter_map(|l| l.ok()) {
+                    if let Some(ref pattern) = args.grep {
+                        if !line.contains(pattern.as_str()) { continue; }
+                    }
+                    println!("{color}[{label}]{reset} {line}");
+                    any_output = true;
+                }
+                *last_pos = current_pos;
+            }
+
+            // Check for new files in watched directories (log rotation)
+        }
+
+        if !any_output {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
+}
+
+/// Collect all log files from a directory recursively.
+fn collect_log_files(
+    dir: &std::path::Path,
+    container_name: &str,
+    files: &mut Vec<(String, std::path::PathBuf)>,
+) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                let fname = path.file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown");
+                // Only watch common log extensions
+                if fname.ends_with(".log") || fname.ends_with(".txt")
+                    || fname.ends_with(".err") || fname.ends_with(".out")
+                    || !fname.contains('.')
+                {
+                    let label = format!("{}:{}", container_name,
+                        path.file_stem().and_then(|s| s.to_str()).unwrap_or(fname));
+                    files.push((label, path));
+                }
+            } else if path.is_dir() {
+                collect_log_files(&path, container_name, files);
+            }
+        }
+    }
 }
 
 fn format_size(bytes: u64) -> String {

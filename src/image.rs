@@ -49,6 +49,12 @@ pub struct ImageConfig {
     /// User (user or user:group)
     #[serde(default)]
     pub user: String,
+    /// Log sources for corten mlogs
+    #[serde(default)]
+    pub log_files: Vec<String>,
+    /// Log directories for corten mlogs
+    #[serde(default)]
+    pub log_dirs: Vec<String>,
 }
 
 /// Host architecture in distro-native naming.
@@ -132,6 +138,8 @@ fn default_image_config(_name: &str) -> ImageConfig {
         entrypoint: Vec::new(),
         working_dir: String::new(),
         user: String::new(),
+        log_files: Vec::new(),
+        log_dirs: Vec::new(),
     }
 }
 

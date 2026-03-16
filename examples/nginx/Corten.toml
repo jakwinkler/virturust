@@ -25,3 +25,7 @@ run = [
 [container]
 command = ["nginx", "-g", "daemon off;"]
 expose = [80]
+
+# Multi-log sources — used by `corten mlogs my-nginx`
+[logs]
+files = ["/var/log/nginx/access.log", "/var/log/nginx/error.log"]

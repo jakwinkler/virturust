@@ -75,6 +75,33 @@ pub enum Commands {
 
     /// Manage named volumes
     Volume(VolumeSubArgs),
+
+    /// Multi-log tail — watch all application logs inside containers
+    Mlogs(MlogsArgs),
+}
+
+/// Arguments for the `mlogs` subcommand.
+#[derive(clap::Args, Debug)]
+pub struct MlogsArgs {
+    /// Container name(s) to watch
+    #[arg(required = true)]
+    pub containers: Vec<String>,
+
+    /// Additional log file to watch (can be repeated)
+    #[arg(short, long = "file")]
+    pub files: Vec<String>,
+
+    /// Additional log directory to watch (can be repeated)
+    #[arg(long = "dir")]
+    pub dirs: Vec<String>,
+
+    /// Filter lines matching this pattern (grep-style)
+    #[arg(short, long)]
+    pub grep: Option<String>,
+
+    /// Number of initial lines to show per file (default: 10)
+    #[arg(short = 'n', long, default_value = "10")]
+    pub tail: usize,
 }
 
 #[derive(clap::Args, Debug)]
