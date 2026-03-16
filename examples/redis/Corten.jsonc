@@ -1,0 +1,35 @@
+{
+  // Redis on Alpine
+  //
+  // Build:  sudo corten build examples/redis
+  // Run:    sudo corten run -d -p 16379:6379 --name myredis my-redis
+  // Test:   redis-cli -h 127.0.0.1 -p 16379 ping
+
+  "image": {
+    "name": "my-redis",
+    "tag": "latest"
+  },
+
+  "base": {
+    "system": "alpine",
+    "version": "3.20"
+  },
+
+  "packages": {
+    "install": ["redis"]
+  },
+
+  "setup": {
+    "run": [
+      "mkdir -p /data",
+      // Bind to all interfaces so the host can reach Redis
+      "sed -i 's/bind 127.0.0.1/bind 0.0.0.0/' /etc/redis.conf"
+    ]
+  },
+
+  "container": {
+    "command": ["redis-server", "/etc/redis.conf"],
+    "workdir": "/data",
+    "expose": [6379]
+  }
+}

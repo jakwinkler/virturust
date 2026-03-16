@@ -79,12 +79,31 @@ corten exec myapp /bin/sh
 corten stop myapp && corten rm myapp
 ```
 
-## Build System (Corten.toml)
+## Build System — Corten.toml vs Dockerfile
 
-Declarative image builds — no Dockerfile needed:
+Dockerfiles are **imperative** — a sequence of shell commands where order matters, caching is fragile, and one wrong `RUN` layer bloats your image. Corten.toml is **declarative** — you describe what you want, Corten figures out how to build it.
 
+### Side-by-side Comparison
+
+**Dockerfile (Docker):**
+```dockerfile
+FROM alpine:3.20
+RUN apk add --no-cache nginx php83 php83-fpm
+RUN mkdir -p /run/nginx /var/www/html
+RUN echo '<h1>Hello!</h1>' > /var/www/html/index.html
+# Wait, should I have combined those RUN commands?
+# Each one creates a layer... let me squash them:
+RUN apk add --no-cache nginx php83 php83-fpm \
+    && mkdir -p /run/nginx /var/www/html \
+    && echo '<h1>Hello!</h1>' > /var/www/html/index.html \
+    && rm -rf /var/cache/apk/*
+COPY nginx.conf /etc/nginx/nginx.conf
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]
+```
+
+**Corten.toml (Corten):**
 ```toml
-# Corten.toml
 [image]
 name = "my-app"
 tag = "latest"
@@ -96,6 +115,11 @@ version = "3.20"
 [packages]
 install = ["nginx", "php83", "php83-fpm"]
 
+[files]
+copy = [
+    { src = "nginx.conf", dest = "/etc/nginx/nginx.conf" },
+]
+
 [setup]
 run = [
     "mkdir -p /run/nginx /var/www/html",
@@ -104,42 +128,138 @@ run = [
 
 [container]
 command = ["nginx", "-g", "daemon off;"]
+expose = [80]
 ```
 
-```bash
-corten build .
-corten run -p 8080:80 my-app
+### Why Corten.toml is Better
+
+| | Dockerfile | Corten.toml |
+|---|---|---|
+| **Format** | Shell script disguised as config | Structured data (TOML or JSONC) |
+| **Package install** | `RUN apk add --no-cache ...` | `install = ["nginx", "php"]` |
+| **Layer optimization** | Manual (`&&` chaining, multi-stage) | Automatic (packages → files → setup → cleanup) |
+| **Cache cleanup** | You must remember `rm -rf /var/cache/apk/*` | Automatic after package install |
+| **File copying** | `COPY src dest` (no ownership control) | `{ src, dest, owner }` |
+| **Validation** | Fails at build time | Validated before build starts (`--dry-run`) |
+| **Comments** | `#` only | TOML `#` or JSONC `//` and `/* */` |
+| **Parseable** | No (it's shell) | Yes (TOML/JSON — any tool can read it) |
+| **IDE support** | Basic | Full schema validation possible |
+
+### Three Format Options
+
+Corten supports TOML, JSON, and JSONC. Use whichever your team prefers:
+
+**TOML** (recommended — clean, readable):
+```toml
+# Corten.toml
+[image]
+name = "my-app"
+tag = "latest"
+
+[base]
+system = "alpine"
+version = "3.20"
+
+[packages]
+install = ["nginx"]
+
+[container]
+command = ["nginx", "-g", "daemon off;"]
 ```
 
-Also supports **JSONC** (JSON with Comments):
-
+**JSONC** (JSON with Comments — familiar to JS/TS devs):
 ```jsonc
 {
-  // My app config
+  // Corten.jsonc
+  "image": { "name": "my-app", "tag": "latest" },
+  "base": { "system": "alpine", "version": "3.20" },
+
+  // Packages are auto-installed via the distro's package manager
+  "packages": { "install": ["nginx"] },
+
+  "container": {
+    "command": ["nginx", "-g", "daemon off;"]
+  }
+}
+```
+
+**JSON** (strict — for automation/CI):
+```json
+{
   "image": { "name": "my-app", "tag": "latest" },
   "base": { "system": "alpine", "version": "3.20" },
   "packages": { "install": ["nginx"] }
 }
 ```
 
+Auto-detected by file extension: `.toml`, `.jsonc`, `.json`.
+
+```bash
+corten build .                    # Looks for Corten.toml, .jsonc, .json
+corten build my-app.jsonc         # Explicit file
+corten build --dry-run .          # Preview without building
+```
+
 ## Multi-Container Orchestration (Forge)
 
-`Cortenforge.toml` — like Docker Compose but in TOML (no YAML, no indentation games):
+Docker Compose uses YAML — indentation-sensitive, type-ambiguous (`8080:80` — string or time?), and the [Norway problem](https://hitchdev.com/strictyaml/why/implicit-typing-removed/) (`NO` becomes `false`).
 
+Corten Forge uses **TOML or JSONC** — no indentation games, explicit types, proper comments.
+
+**docker-compose.yml (Docker):**
+```yaml
+services:
+  api:
+    image: my-api
+    ports:
+      - "8080:80"        # Is this a string? A number? Who knows
+    depends_on:
+      - db               # One wrong space = broken
+    deploy:
+      resources:
+        limits:
+          memory: 256M    # Why so deeply nested?
+    environment:
+      - DB_HOST=db        # A list of strings, not a map?
+
+  db:
+    image: my-db
+```
+
+**Cortenforge.toml (Corten):**
 ```toml
-# Cortenforge.toml
 [services.api]
 image = "my-api"
 ports = ["8080:80"]
 depends_on = ["db"]
-memory = "256m"
+memory = "256m"              # Flat, not deploy.resources.limits.memory
 
 [services.api.env]
-DB_HOST = "db"
+DB_HOST = "db"               # Proper key-value map
 
 [services.db]
 image = "my-db"
 memory = "512m"
+```
+
+**Cortenforge.jsonc** (same thing, for JSON fans):
+```jsonc
+{
+  "services": {
+    "api": {
+      "image": "my-api",
+      "ports": ["8080:80"],
+      "depends_on": ["db"],
+      "memory": "256m",
+      // Environment as a real map, not a list of "KEY=VALUE" strings
+      "env": { "DB_HOST": "db" }
+    },
+    "db": {
+      "image": "my-db",
+      "memory": "512m"
+    }
+  }
+}
 ```
 
 ```bash

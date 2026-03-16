@@ -1,0 +1,39 @@
+{
+  // PHP + Nginx Stack
+  //
+  // Two containers working together:
+  //   nginx -> reverse proxy -> php-fpm (FastCGI)
+  //
+  // Build:
+  //   corten build examples/php-nginx/php-fpm
+  //   corten build examples/php-nginx/nginx
+  //
+  // Run:
+  //   cd examples/php-nginx
+  //   corten forge up
+  //
+  // Test:
+  //   curl http://localhost:8080/
+  //   curl http://localhost:8080/info.php
+
+  "services": {
+    // PHP-FPM backend
+    "php": {
+      "image": "stack-php",
+      "restart": "always",
+      "memory": "128m",
+      "env": {
+        "PHP_ENV": "production"
+      }
+    },
+
+    // Nginx frontend — depends on PHP
+    "nginx": {
+      "image": "stack-nginx",
+      "ports": ["8080:8080"],
+      "depends_on": ["php"],
+      "restart": "always",
+      "memory": "64m"
+    }
+  }
+}

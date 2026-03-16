@@ -1,0 +1,34 @@
+{
+  // Nginx reverse proxy for PHP-FPM
+  //
+  // Proxies requests to the php container via FastCGI.
+  // Listens on port 8080 (non-privileged).
+
+  "image": {
+    "name": "stack-nginx",
+    "tag": "latest"
+  },
+
+  "base": {
+    "system": "alpine",
+    "version": "3.20"
+  },
+
+  "packages": {
+    "install": ["nginx"]
+  },
+
+  "setup": {
+    "run": [
+      "mkdir -p /run/nginx /var/www/html",
+      // Write nginx config that proxies PHP to the php container
+      "cat > /etc/nginx/http.d/default.conf <<'NGINX'\nserver {\n    listen 8080 default_server;\n    root /var/www/html;\n    index index.php index.html;\n\n    location / {\n        try_files $uri $uri/ =404;\n    }\n\n    location ~ \\.php$ {\n        fastcgi_pass php:9000;\n        fastcgi_param SCRIPT_FILENAME /var/www/html$fastcgi_script_name;\n        include fastcgi_params;\n    }\n}\nNGINX",
+      // Create a static page
+      "echo '<h1>Nginx is running!</h1><p><a href=\"/index.php\">Test PHP</a> | <a href=\"/info.php\">PHP Info</a></p>' > /var/www/html/index.html"
+    ]
+  },
+
+  "container": {
+    "command": ["/bin/sh", "-c", "mkdir -p /run/nginx && exec nginx -g 'daemon off;'"]
+  }
+}
