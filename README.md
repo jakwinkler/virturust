@@ -70,14 +70,24 @@ corten pull alpine
 # Run a container — no sudo needed
 corten run alpine echo "hello from corten"
 
+# Interactive shell (like docker run -it)
+corten run -it alpine /bin/sh
+# [corten:abc123] / $ ls
+# [corten:abc123] / $ exit
+
 # Run with resource limits and port forwarding
 corten run --memory 256m --cpus 0.5 -p 8080:80 my-nginx
 
-# Detached mode
+# Detached mode + exec into running container
 corten run -d --name myapp alpine sleep 3600
 corten logs myapp
-corten exec myapp /bin/sh
+corten exec -it myapp /bin/sh    # Interactive shell inside running container
 corten stop myapp && corten rm myapp
+
+# Named volumes with size limits (Docker can't do this)
+corten volume create dbdata --size 500m
+corten run -d --name db -v dbdata:/var/lib/mysql my-mysql
+corten volume resize dbdata 1g   # Live resize!
 ```
 
 ## Build System — Corten.toml vs Dockerfile
@@ -504,13 +514,15 @@ corten images
 corten ps
 corten inspect <CONTAINER>
 corten logs [-f] [-n N] <CONTAINER>
-corten exec <CONTAINER> <COMMAND>...
+corten exec [-it] <CONTAINER> <COMMAND>...
 corten stop [--time N] <CONTAINER>
 corten rm <CONTAINER>
 corten kill [-s SIGNAL] <CONTAINER>
 corten cp <SRC> <DST>
 corten stats [CONTAINER]
 corten network create|ls|rm <NAME>
+corten volume create [--size SIZE] <NAME>
+corten volume ls|inspect|rm|resize|prune
 corten forge [-f FILE] up|down|ps|logs
 corten system prune
 ```
