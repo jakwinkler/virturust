@@ -873,64 +873,212 @@ fn copy_dir_for_cp(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
 
 /// Remove stopped containers and unused images.
 /// Execute the `volume` subcommand — manage named volumes.
+///
+/// Supports two types:
+/// - **Directory volumes** (no --size): unlimited, just a directory
+/// - **Sized volumes** (--size 500m): loopback ext4 with enforced limit
 fn cmd_volume(args: corten::cli::VolumeSubArgs) -> Result<()> {
     use corten::cli::VolumeCommands;
     let vdir = config::volumes_dir();
 
     match args.command {
         VolumeCommands::Create(a) => {
+            std::fs::create_dir_all(&vdir)?;
             let vol_path = vdir.join(&a.name);
-            if vol_path.exists() {
+            let img_path = vdir.join(format!("{}.img", a.name));
+
+            if vol_path.exists() || img_path.exists() {
                 return Err(anyhow!("volume '{}' already exists", a.name));
             }
-            std::fs::create_dir_all(&vol_path)
-                .with_context(|| format!("failed to create volume '{}'", a.name))?;
-            println!("Created volume: {}", a.name);
+
+            if let Some(size_str) = &a.size {
+                // Sized volume: create sparse file + ext4 + mount point
+                let size_bytes = config::parse_memory(size_str)?;
+                let size_mb = std::cmp::max(size_bytes / (1024 * 1024), 1);
+
+                // Create sparse file (doesn't actually allocate disk until written)
+                let f = std::fs::File::create(&img_path)?;
+                f.set_len(size_bytes)?;
+
+                // Format as ext4
+                let status = std::process::Command::new("mkfs.ext4")
+                    .args(["-q", "-F", &img_path.to_string_lossy()])
+                    .output()
+                    .context("mkfs.ext4 not found — install e2fsprogs")?;
+                if !status.status.success() {
+                    std::fs::remove_file(&img_path).ok();
+                    return Err(anyhow!("mkfs.ext4 failed"));
+                }
+
+                // Create mount point
+                std::fs::create_dir_all(&vol_path)?;
+
+                // Mount it
+                let status = std::process::Command::new("mount")
+                    .args(["-o", "loop", &img_path.to_string_lossy(), &vol_path.to_string_lossy()])
+                    .output()?;
+                if !status.status.success() {
+                    // Mount might need to happen at container start time
+                    log::info!("volume created but not mounted (will mount on use)");
+                }
+
+                println!("Created sized volume: {} ({} MB)", a.name, size_mb);
+                println!("  Image: {}", img_path.display());
+                println!("  Mount: {}", vol_path.display());
+            } else {
+                // Directory volume: no size limit
+                std::fs::create_dir_all(&vol_path)?;
+                println!("Created volume: {}", a.name);
+            }
         }
         VolumeCommands::Ls => {
-            println!("{:<20} {:<15} {}", "NAME", "SIZE", "PATH");
-            println!("{}", "-".repeat(60));
+            println!("{:<20} {:<10} {:<12} {}", "NAME", "TYPE", "SIZE/LIMIT", "PATH");
+            println!("{}", "-".repeat(70));
             if vdir.exists() {
                 for entry in std::fs::read_dir(&vdir)? {
                     let entry = entry?;
-                    if entry.file_type()?.is_dir() {
-                        let name = entry.file_name().to_string_lossy().to_string();
-                        // Calculate size
-                        let size = dir_size(&entry.path());
-                        let size_str = if size > 1024 * 1024 {
-                            format!("{:.1} MB", size as f64 / 1024.0 / 1024.0)
-                        } else if size > 1024 {
-                            format!("{:.1} KB", size as f64 / 1024.0)
-                        } else {
-                            format!("{} B", size)
-                        };
-                        println!("{:<20} {:<15} {}", name, size_str, entry.path().display());
-                    }
+                    let fname = entry.file_name().to_string_lossy().to_string();
+
+                    // Skip .img files in listing (show mount dirs only)
+                    if fname.ends_with(".img") { continue; }
+                    if !entry.file_type()?.is_dir() { continue; }
+
+                    let img = vdir.join(format!("{fname}.img"));
+                    let (vol_type, size_str) = if img.exists() {
+                        let img_size = std::fs::metadata(&img).map(|m| m.len()).unwrap_or(0);
+                        let used = dir_size(&entry.path());
+                        ("sized", format!("{:.1}/{:.0}M",
+                            used as f64 / 1024.0 / 1024.0,
+                            img_size as f64 / 1024.0 / 1024.0))
+                    } else {
+                        let used = dir_size(&entry.path());
+                        ("dir", format_size(used))
+                    };
+
+                    println!("{:<20} {:<10} {:<12} {}", fname, vol_type, size_str, entry.path().display());
                 }
             }
         }
         VolumeCommands::Inspect(a) => {
             let vol_path = vdir.join(&a.name);
-            if !vol_path.exists() {
+            let img_path = vdir.join(format!("{}.img", a.name));
+
+            if !vol_path.exists() && !img_path.exists() {
                 return Err(anyhow!("volume '{}' not found", a.name));
             }
-            let size = dir_size(&vol_path);
-            println!("Name:    {}", a.name);
-            println!("Path:    {}", vol_path.display());
-            println!("Size:    {} bytes ({:.1} MB)", size, size as f64 / 1024.0 / 1024.0);
-            // Count files
+
+            println!("Name:      {}", a.name);
+            println!("Path:      {}", vol_path.display());
+
+            if img_path.exists() {
+                let img_size = std::fs::metadata(&img_path).map(|m| m.len()).unwrap_or(0);
+                let used = dir_size(&vol_path);
+                println!("Type:      sized (loopback ext4)");
+                println!("Image:     {}", img_path.display());
+                println!("Limit:     {} ({} bytes)", format_size(img_size), img_size);
+                println!("Used:      {} ({} bytes)", format_size(used), used);
+                println!("Available: {}", format_size(img_size.saturating_sub(used)));
+            } else {
+                let used = dir_size(&vol_path);
+                println!("Type:      directory (no limit)");
+                println!("Used:      {} ({} bytes)", format_size(used), used);
+            }
+
             let count = std::fs::read_dir(&vol_path)
                 .map(|entries| entries.count())
                 .unwrap_or(0);
-            println!("Files:   {}", count);
+            println!("Entries:   {}", count);
+        }
+        VolumeCommands::Resize(a) => {
+            let img_path = vdir.join(format!("{}.img", a.name));
+            let vol_path = vdir.join(&a.name);
+
+            if !img_path.exists() {
+                return Err(anyhow!(
+                    "volume '{}' is not a sized volume (no .img file). Only sized volumes can be resized.",
+                    a.name
+                ));
+            }
+
+            let new_size_bytes = config::parse_memory(&a.size)?;
+            let old_size = std::fs::metadata(&img_path).map(|m| m.len()).unwrap_or(0);
+
+            if new_size_bytes == old_size {
+                println!("Volume '{}' is already {}", a.name, format_size(new_size_bytes));
+                return Ok(());
+            }
+
+            // Unmount if mounted
+            std::process::Command::new("umount")
+                .arg(&vol_path.to_string_lossy().to_string())
+                .output().ok();
+
+            if new_size_bytes > old_size {
+                // Grow: expand file, then resize filesystem
+                let f = std::fs::OpenOptions::new().write(true).open(&img_path)?;
+                f.set_len(new_size_bytes)?;
+                drop(f);
+
+                let status = std::process::Command::new("e2fsck")
+                    .args(["-f", "-y", &img_path.to_string_lossy()])
+                    .output()?;
+                if !status.status.success() {
+                    log::warn!("e2fsck reported issues (may be OK)");
+                }
+
+                let status = std::process::Command::new("resize2fs")
+                    .arg(&img_path.to_string_lossy().to_string())
+                    .output()
+                    .context("resize2fs not found — install e2fsprogs")?;
+                if !status.status.success() {
+                    return Err(anyhow!("resize2fs failed"));
+                }
+            } else {
+                // Shrink: resize filesystem first, then truncate file
+                let new_size_k = new_size_bytes / 1024;
+
+                let status = std::process::Command::new("e2fsck")
+                    .args(["-f", "-y", &img_path.to_string_lossy()])
+                    .output()?;
+                if !status.status.success() {
+                    log::warn!("e2fsck reported issues");
+                }
+
+                let status = std::process::Command::new("resize2fs")
+                    .args([&img_path.to_string_lossy().to_string(), &format!("{new_size_k}K")])
+                    .output()
+                    .context("resize2fs not found")?;
+                if !status.status.success() {
+                    return Err(anyhow!("resize2fs failed — volume may have too much data for new size"));
+                }
+
+                let f = std::fs::OpenOptions::new().write(true).open(&img_path)?;
+                f.set_len(new_size_bytes)?;
+            }
+
+            // Re-mount
+            std::process::Command::new("mount")
+                .args(["-o", "loop", &img_path.to_string_lossy(), &vol_path.to_string_lossy()])
+                .output().ok();
+
+            println!("Resized volume '{}': {} -> {}",
+                a.name, format_size(old_size), format_size(new_size_bytes));
         }
         VolumeCommands::Rm(a) => {
             let vol_path = vdir.join(&a.name);
-            if !vol_path.exists() {
+            let img_path = vdir.join(format!("{}.img", a.name));
+
+            if !vol_path.exists() && !img_path.exists() {
                 return Err(anyhow!("volume '{}' not found", a.name));
             }
-            std::fs::remove_dir_all(&vol_path)
-                .with_context(|| format!("failed to remove volume '{}'", a.name))?;
+
+            // Unmount if mounted
+            std::process::Command::new("umount")
+                .arg(&vol_path.to_string_lossy().to_string())
+                .output().ok();
+
+            std::fs::remove_dir_all(&vol_path).ok();
+            std::fs::remove_file(&img_path).ok();
             println!("Removed volume: {}", a.name);
         }
         VolumeCommands::Prune => {
@@ -941,10 +1089,20 @@ fn cmd_volume(args: corten::cli::VolumeSubArgs) -> Result<()> {
             let mut removed = 0;
             for entry in std::fs::read_dir(&vdir)? {
                 let entry = entry?;
+                let fname = entry.file_name().to_string_lossy().to_string();
+                if fname.ends_with(".img") {
+                    std::fs::remove_file(entry.path()).ok();
+                    continue; // counted with the dir
+                }
                 if entry.file_type()?.is_dir() {
-                    let name = entry.file_name().to_string_lossy().to_string();
+                    // Unmount if needed
+                    std::process::Command::new("umount")
+                        .arg(&entry.path().to_string_lossy().to_string())
+                        .output().ok();
                     std::fs::remove_dir_all(entry.path()).ok();
-                    println!("Removed: {}", name);
+                    // Also remove .img if exists
+                    std::fs::remove_file(vdir.join(format!("{fname}.img"))).ok();
+                    println!("Removed: {}", fname);
                     removed += 1;
                 }
             }
@@ -952,6 +1110,18 @@ fn cmd_volume(args: corten::cli::VolumeSubArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn format_size(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.1} GB", bytes as f64 / 1024.0 / 1024.0 / 1024.0)
+    } else if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / 1024.0 / 1024.0)
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{} B", bytes)
+    }
 }
 
 fn dir_size(path: &std::path::Path) -> u64 {

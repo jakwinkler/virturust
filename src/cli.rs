@@ -93,6 +93,8 @@ pub enum VolumeCommands {
     Rm(VolumeRmArgs),
     /// Inspect a volume
     Inspect(VolumeInspectArgs),
+    /// Resize a volume (grow or shrink)
+    Resize(VolumeResizeArgs),
     /// Remove unused volumes
     Prune,
 }
@@ -101,6 +103,20 @@ pub enum VolumeCommands {
 pub struct VolumeCreateArgs {
     /// Volume name
     pub name: String,
+
+    /// Size limit (e.g., "500m", "2g"). Creates a size-enforced volume.
+    /// Without this, volume has no size limit (directory-based).
+    #[arg(short, long)]
+    pub size: Option<String>,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct VolumeResizeArgs {
+    /// Volume name
+    pub name: String,
+
+    /// New size (e.g., "1g", "500m"). Must be larger than current usage.
+    pub size: String,
 }
 
 #[derive(clap::Args, Debug)]
