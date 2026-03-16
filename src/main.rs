@@ -542,7 +542,17 @@ fn cmd_exec(args: corten::cli::ExecArgs) -> Result<()> {
         "--pid",
         "--",
     ]);
+
+    // Set ENV for shell profile (nice prompt)
+    cmd.env("ENV", "/etc/profile.d/corten.sh");
+    cmd.env("TERM", "xterm-256color");
+
     cmd.args(&args.command);
+
+    // Always inherit stdin/stdout/stderr — nsenter handles TTY passthrough
+    cmd.stdin(std::process::Stdio::inherit());
+    cmd.stdout(std::process::Stdio::inherit());
+    cmd.stderr(std::process::Stdio::inherit());
 
     let status = cmd
         .status()

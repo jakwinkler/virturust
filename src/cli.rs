@@ -365,6 +365,14 @@ pub struct ExecArgs {
     /// Command and arguments to execute
     #[arg(trailing_var_arg = true, required = true)]
     pub command: Vec<String>,
+
+    /// Keep STDIN open (interactive)
+    #[arg(short = 'i', long = "interactive")]
+    pub interactive: bool,
+
+    /// Allocate a pseudo-TTY
+    #[arg(short = 't', long = "tty")]
+    pub tty: bool,
 }
 
 /// Arguments for the `build` subcommand.
