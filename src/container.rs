@@ -517,7 +517,13 @@ fn pty_forward(master_fd: i32, child_pid: i32, interactive: bool) -> Result<()> 
     if is_tty {
         unsafe { libc::tcgetattr(0, &mut orig_termios) };
         let mut raw = orig_termios;
-        unsafe { libc::cfmakeraw(&mut raw) };
+        // Disable input processing (let PTY handle it)
+        raw.c_iflag &= !(libc::BRKINT | libc::ICRNL | libc::INPCK | libc::ISTRIP | libc::IXON);
+        // Disable canonical mode + echo (we get raw keystrokes)
+        raw.c_lflag &= !(libc::ECHO | libc::ICANON | libc::IEXTEN | libc::ISIG);
+        // Keep OPOST for output processing (newline translation)
+        raw.c_cc[libc::VMIN] = 1;
+        raw.c_cc[libc::VTIME] = 0;
         unsafe { libc::tcsetattr(0, libc::TCSANOW, &raw) };
     }
 
