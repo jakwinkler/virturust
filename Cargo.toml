@@ -64,3 +64,7 @@ path = "tests/e2e/lifecycle_test.rs"
 [[test]]
 name = "isolation_test"
 path = "tests/isolation_test.rs"
+
+[[test]]
+name = "user_isolation_test"
+path = "tests/e2e/user_isolation_test.rs"
