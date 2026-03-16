@@ -151,26 +151,98 @@ corten forge down     # Stop and clean up
 
 ## Per-User Container Isolation
 
-A security feature Docker doesn't have. Each user gets their own container namespace:
+A security feature neither Docker nor Podman offers at this level.
+
+### The Docker Problem
+
+Docker's `docker` group is essentially **root access**. Any user in the group can see, stop, exec into, and read logs of every other user's containers — and even escape to the host filesystem via volume mounts.
+
+```bash
+# In Docker: alice can mess with bob's containers
+alice$ docker ps              # See ALL containers (bob's too)
+alice$ docker exec bob-db sh  # Shell into bob's database
+alice$ docker logs bob-app    # Read bob's secrets
+alice$ docker stop bob-app    # Kill bob's production app
+```
+
+### The Corten Solution
+
+Each user gets their own isolated container directory. The kernel UID (from `getuid()`) determines which containers you can access — it cannot be spoofed.
 
 ```
 /var/lib/corten/
-  images/              # Shared (all users)
+  images/                    # Shared read-only (all users)
+    alpine/latest/rootfs/
+    my-nginx/latest/rootfs/
   users/
-    1000/containers/   # jakub's containers (only jakub sees these)
-    1001/containers/   # alice's containers (only alice sees these)
+    1000/                    # jakub (uid 1000)
+      containers/
+        abc123/              # jakub's web server
+        def456/              # jakub's database
+    1001/                    # alice (uid 1001)
+      containers/
+        789xyz/              # alice's API — jakub can't see this
 ```
 
-- User A cannot see, stop, exec, or read logs of User B's containers
-- The `corten` group controls who can run containers
-- Images are shared read-only across all users
+**What happens when alice tries to access jakub's container:**
 
 ```bash
-# Add a user to the corten group
+jakub$ corten run -d --name mydb alpine sleep 3600  # Stored under users/1000/
+alice$ corten ps           # Searches users/1001/ → empty, mydb not visible
+alice$ corten stop mydb    # "container not found"
+alice$ corten exec mydb sh # "container not found"
+alice$ corten logs mydb    # "container not found"
+```
+
+Alice cannot even **discover** that jakub's container exists.
+
+### Security Layers
+
+| Layer | What it does | How it works |
+|-------|-------------|--------------|
+| **Group gate** | Controls who can run corten at all | `corten` group membership checked against real `getuid()` |
+| **Per-user paths** | Isolates container storage | Every operation scoped to `/var/lib/corten/users/<uid>/` |
+| **Shared images** | Efficient storage | Images at `/var/lib/corten/images/` — pull once, used by everyone via OverlayFS |
+
+### What's Protected
+
+| Operation | Docker | Corten |
+|-----------|--------|--------|
+| `ps` — list containers | Sees ALL users' containers | **Only own** |
+| `stop` — stop container | Can stop anyone's | **Only own** |
+| `rm` — remove container | Can remove anyone's | **Only own** |
+| `exec` — shell into | Can exec into anyone's | **Only own** |
+| `logs` — read output | Can read anyone's | **Only own** |
+| `inspect` — view config | Can inspect anyone's | **Only own** |
+| `images` — list images | Shared | Shared |
+| `pull` — download image | Shared | Shared |
+
+### Setup
+
+```bash
+# Create the corten group (done automatically by make install)
+sudo groupadd corten
+
+# Add users who should be allowed to run containers
+sudo usermod -aG corten jakub
 sudo usermod -aG corten alice
 
-# Alice can only see her own containers
-su alice -c "corten ps"    # Shows only alice's containers
+# Users must log out and back in for group change to take effect
+```
+
+### Verified by Tests
+
+8 end-to-end tests confirm the isolation:
+
+```
+test user_a_cannot_see_user_b_containers ........ ok
+test user_cannot_rm_other_users_container ........ ok
+test user_cannot_stop_other_users_container ...... ok
+test user_cannot_inspect_other_users_container ... ok
+test user_cannot_exec_into_other_users_container . ok
+test user_cannot_read_other_users_logs ........... ok
+test ps_only_shows_own_containers ................ ok
+test shared_images_work_for_all_users ............ ok
 ```
 
 ## Image Sources (No Docker Hub)
