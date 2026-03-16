@@ -78,6 +78,67 @@ pub enum Commands {
 
     /// Multi-log tail — watch all application logs inside containers
     Mlogs(MlogsArgs),
+
+    /// Container filesystem snapshots (save/restore/rollback)
+    Snapshot(SnapshotSubArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct SnapshotSubArgs {
+    #[command(subcommand)]
+    pub command: SnapshotCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SnapshotCommands {
+    /// Create a snapshot of a container's filesystem changes
+    Create(SnapshotCreateArgs),
+    /// Restore a container to a previous snapshot
+    Restore(SnapshotRestoreArgs),
+    /// List snapshots for a container
+    Ls(SnapshotLsArgs),
+    /// Remove a snapshot
+    Rm(SnapshotRmArgs),
+    /// Show what changed between current state and a snapshot
+    Diff(SnapshotDiffArgs),
+}
+
+#[derive(clap::Args, Debug)]
+pub struct SnapshotCreateArgs {
+    /// Container name or ID
+    pub container: String,
+    /// Snapshot name (e.g., "v1.0", "before-migration", "clean-db")
+    pub name: String,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct SnapshotRestoreArgs {
+    /// Container name or ID
+    pub container: String,
+    /// Snapshot name to restore
+    pub name: String,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct SnapshotLsArgs {
+    /// Container name or ID
+    pub container: String,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct SnapshotRmArgs {
+    /// Container name or ID
+    pub container: String,
+    /// Snapshot name to remove
+    pub name: String,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct SnapshotDiffArgs {
+    /// Container name or ID
+    pub container: String,
+    /// Snapshot name to compare against (current state vs snapshot)
+    pub name: String,
 }
 
 /// Arguments for the `mlogs` subcommand.

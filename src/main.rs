@@ -83,6 +83,7 @@ async fn main() -> Result<()> {
         Commands::Forge(args) => cmd_forge(args).await?,
         Commands::Volume(args) => cmd_volume(args)?,
         Commands::Mlogs(args) => cmd_mlogs(args)?,
+        Commands::Snapshot(args) => cmd_snapshot(args)?,
     }
 
     Ok(())
@@ -1319,6 +1320,190 @@ fn collect_log_files(
             }
         }
     }
+}
+
+/// Execute the `snapshot` subcommand — container filesystem snapshots.
+fn cmd_snapshot(args: corten::cli::SnapshotSubArgs) -> Result<()> {
+    use corten::cli::SnapshotCommands;
+
+    match args.command {
+        SnapshotCommands::Create(a) => {
+            let container_dir = container::find_container(&a.container)?;
+            let upper = container_dir.join("overlay").join("upper");
+            if !upper.exists() {
+                return Err(anyhow!("container '{}' has no overlay (not running or no changes)", a.container));
+            }
+
+            let snap_dir = container_dir.join("snapshots");
+            std::fs::create_dir_all(&snap_dir)?;
+            let snap_path = snap_dir.join(format!("{}.tar.gz", a.name));
+
+            if snap_path.exists() {
+                return Err(anyhow!("snapshot '{}' already exists", a.name));
+            }
+
+            // Tar the upper (diff) layer
+            let status = std::process::Command::new("tar")
+                .args(["czf", &snap_path.to_string_lossy(), "-C", &upper.to_string_lossy(), "."])
+                .status()
+                .context("failed to create snapshot tarball")?;
+
+            if !status.success() {
+                return Err(anyhow!("tar failed to create snapshot"));
+            }
+
+            let size = std::fs::metadata(&snap_path).map(|m| m.len()).unwrap_or(0);
+            println!("Created snapshot '{}' for container '{}'", a.name, a.container);
+            println!("  Size: {}", format_size(size));
+            println!("  Path: {}", snap_path.display());
+        }
+        SnapshotCommands::Restore(a) => {
+            let container_dir = container::find_container(&a.container)?;
+            let upper = container_dir.join("overlay").join("upper");
+            let snap_path = container_dir.join("snapshots").join(format!("{}.tar.gz", a.name));
+
+            if !snap_path.exists() {
+                return Err(anyhow!("snapshot '{}' not found", a.name));
+            }
+
+            // Check if container is running
+            let state = container::load_state(&container_dir)?;
+            if state.status == ContainerStatus::Running {
+                return Err(anyhow!("stop the container first: corten stop {}", a.container));
+            }
+
+            // Clear current changes and restore from snapshot
+            if upper.exists() {
+                std::fs::remove_dir_all(&upper)?;
+            }
+            std::fs::create_dir_all(&upper)?;
+
+            let status = std::process::Command::new("tar")
+                .args(["xzf", &snap_path.to_string_lossy(), "-C", &upper.to_string_lossy()])
+                .status()
+                .context("failed to restore snapshot")?;
+
+            if !status.success() {
+                return Err(anyhow!("tar failed to restore snapshot"));
+            }
+
+            println!("Restored container '{}' to snapshot '{}'", a.container, a.name);
+        }
+        SnapshotCommands::Ls(a) => {
+            let container_dir = container::find_container(&a.container)?;
+            let snap_dir = container_dir.join("snapshots");
+
+            println!("{:<20} {:<12} {}", "NAME", "SIZE", "CREATED");
+            println!("{}", "-".repeat(55));
+
+            if snap_dir.exists() {
+                let mut entries: Vec<_> = std::fs::read_dir(&snap_dir)?
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("gz"))
+                    .collect();
+                entries.sort_by_key(|e| e.metadata().ok().and_then(|m| m.modified().ok()));
+
+                for entry in entries {
+                    let fname = entry.file_name().to_string_lossy().to_string();
+                    let name = fname.trim_end_matches(".tar.gz");
+                    let meta = entry.metadata()?;
+                    let size = format_size(meta.len());
+                    let modified = meta.modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| {
+                            let secs = d.as_secs();
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap().as_secs();
+                            let ago = now - secs;
+                            if ago < 60 { format!("{ago}s ago") }
+                            else if ago < 3600 { format!("{}m ago", ago / 60) }
+                            else if ago < 86400 { format!("{}h ago", ago / 3600) }
+                            else { format!("{}d ago", ago / 86400) }
+                        })
+                        .unwrap_or_else(|| "unknown".to_string());
+                    println!("{:<20} {:<12} {}", name, size, modified);
+                }
+            }
+        }
+        SnapshotCommands::Rm(a) => {
+            let container_dir = container::find_container(&a.container)?;
+            let snap_path = container_dir.join("snapshots").join(format!("{}.tar.gz", a.name));
+
+            if !snap_path.exists() {
+                return Err(anyhow!("snapshot '{}' not found", a.name));
+            }
+
+            std::fs::remove_file(&snap_path)?;
+            println!("Removed snapshot '{}'", a.name);
+        }
+        SnapshotCommands::Diff(a) => {
+            let container_dir = container::find_container(&a.container)?;
+            let upper = container_dir.join("overlay").join("upper");
+            let snap_path = container_dir.join("snapshots").join(format!("{}.tar.gz", a.name));
+
+            if !snap_path.exists() {
+                return Err(anyhow!("snapshot '{}' not found", a.name));
+            }
+
+            // List current files in upper
+            let current_files = list_files_recursive(&upper, &upper);
+
+            // List files in snapshot
+            let output = std::process::Command::new("tar")
+                .args(["tzf", &snap_path.to_string_lossy()])
+                .output()?;
+            let snap_files: std::collections::HashSet<String> = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(|l| l.trim_start_matches("./").to_string())
+                .filter(|l| !l.is_empty())
+                .collect();
+
+            let current_set: std::collections::HashSet<String> = current_files.iter().cloned().collect();
+
+            // Added (in current, not in snapshot)
+            let mut added: Vec<&String> = current_set.difference(&snap_files).collect();
+            added.sort();
+            for f in &added {
+                println!("\x1b[32m+ {f}\x1b[0m");
+            }
+
+            // Removed (in snapshot, not in current)
+            let mut removed: Vec<&String> = snap_files.difference(&current_set).collect();
+            removed.sort();
+            for f in &removed {
+                println!("\x1b[31m- {f}\x1b[0m");
+            }
+
+            // Modified (in both — can't easily detect content changes without extracting)
+            let common = current_set.intersection(&snap_files).count();
+
+            println!("\n{} added, {} removed, {} common",
+                added.len(), removed.len(), common);
+        }
+    }
+    Ok(())
+}
+
+fn list_files_recursive(dir: &std::path::Path, base: &std::path::Path) -> Vec<String> {
+    let mut files = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let relative = path.strip_prefix(base)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .to_string();
+            if path.is_dir() {
+                files.push(format!("{relative}/"));
+                files.extend(list_files_recursive(&path, base));
+            } else {
+                files.push(relative);
+            }
+        }
+    }
+    files
 }
 
 fn format_size(bytes: u64) -> String {
