@@ -9,7 +9,7 @@
 set -euo pipefail
 
 CORTEN="${CORTEN:-$(command -v corten || echo ./target/release/corten)}"
-COUNT=20
+COUNT=${1:-20}
 
 red()    { echo -e "\033[31m$*\033[0m"; }
 green()  { echo -e "\033[32m$*\033[0m"; }
