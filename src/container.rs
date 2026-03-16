@@ -182,6 +182,17 @@ pub fn run_with_tty(config: &ContainerConfig, detach: bool, tty: bool, interacti
         crate::network::setup_container_dns(&container_rootfs).ok();
     }
 
+    // Write container shell profile for a nice prompt
+    let profile_dir = container_rootfs.join("etc/profile.d");
+    fs::create_dir_all(&profile_dir).ok();
+    fs::write(
+        profile_dir.join("corten.sh"),
+        format!(
+            "export PS1='[corten:{}] \\w \\$ '\nexport TERM=xterm-256color\n",
+            config.name
+        ),
+    ).ok();
+
     // Initial state: created
     let mut state = ContainerState {
         status: ContainerStatus::Created,

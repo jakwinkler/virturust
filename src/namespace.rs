@@ -217,6 +217,9 @@ fn child_main(args: &ChildArgs) -> Result<()> {
     // (execvpe uses the caller's PATH for resolution, not the envp argument)
     unsafe {
         std::env::set_var("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+        std::env::set_var("TERM", "xterm-256color");
+        // ENV tells sh to source this file on startup (for interactive prompt)
+        std::env::set_var("ENV", "/etc/profile.d/corten.sh");
     }
     let mut env_map: std::collections::HashMap<String, String> = std::env::vars().collect();
     let c_env: Vec<CString> = env_map.iter()
