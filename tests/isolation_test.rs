@@ -127,58 +127,38 @@ fn jsonc_nested_block_not_supported() {
 // Per-User Container Isolation
 // =============================================================================
 
+/// All per-user isolation tests in ONE test to avoid env var races.
+/// (env vars are process-wide, tests run in parallel threads)
 #[test]
-fn per_user_containers_dir_uses_uid() {
+fn per_user_container_isolation() {
+    // Test 1: Per-user dir uses UID
     unsafe { std::env::set_var("CORTEN_REAL_UID", "1234"); }
     let dir = corten::config::containers_dir();
-    assert!(
-        dir.to_string_lossy().contains("users/1234"),
-        "Expected per-user path with uid 1234, got: {}",
-        dir.display()
-    );
-    unsafe { std::env::set_var("CORTEN_REAL_UID", "0"); }
-}
+    assert!(dir.to_string_lossy().contains("users/1234"),
+        "Expected per-user path with uid 1234, got: {}", dir.display());
 
-#[test]
-fn root_containers_dir_is_legacy() {
+    // Test 2: Root uses legacy path
     unsafe { std::env::set_var("CORTEN_REAL_UID", "0"); }
     let dir = corten::config::containers_dir();
-    assert!(
-        !dir.to_string_lossy().contains("users/"),
-        "Root should use legacy path without 'users/', got: {}",
-        dir.display()
-    );
-}
+    assert!(!dir.to_string_lossy().contains("users/"),
+        "Root should use legacy path, got: {}", dir.display());
 
-#[test]
-fn images_dir_shared_across_users() {
+    // Test 3: Images shared across users
     unsafe { std::env::set_var("CORTEN_REAL_UID", "9999"); }
     let dir = corten::config::images_dir();
-    assert!(
-        !dir.to_string_lossy().contains("users/"),
-        "Images should be shared (not per-user), got: {}",
-        dir.display()
-    );
-    unsafe { std::env::set_var("CORTEN_REAL_UID", "0"); }
-}
+    assert!(!dir.to_string_lossy().contains("users/"),
+        "Images should be shared, got: {}", dir.display());
 
-#[test]
-fn different_users_different_dirs() {
+    // Test 4: Different users get different dirs
     unsafe { std::env::set_var("CORTEN_REAL_UID", "1000"); }
     let dir_a = corten::config::containers_dir();
-
     unsafe { std::env::set_var("CORTEN_REAL_UID", "1001"); }
     let dir_b = corten::config::containers_dir();
-
     assert_ne!(dir_a, dir_b);
     assert!(dir_a.to_string_lossy().contains("1000"));
     assert!(dir_b.to_string_lossy().contains("1001"));
 
-    unsafe { std::env::set_var("CORTEN_REAL_UID", "0"); }
-}
-
-#[test]
-fn custom_data_dir_with_per_user() {
+    // Test 5: Custom data dir with per-user
     unsafe {
         std::env::set_var("CORTEN_DATA_DIR", "/tmp/corten-test-isolation");
         std::env::set_var("CORTEN_REAL_UID", "5000");
@@ -186,28 +166,20 @@ fn custom_data_dir_with_per_user() {
     let cdir = corten::config::containers_dir();
     assert!(cdir.to_string_lossy().starts_with("/tmp/corten-test-isolation"));
     assert!(cdir.to_string_lossy().contains("users/5000"));
-
-    // Images still shared under custom data dir
     let idir = corten::config::images_dir();
     assert!(idir.to_string_lossy().starts_with("/tmp/corten-test-isolation"));
     assert!(!idir.to_string_lossy().contains("users/"));
 
+    // Test 6: Missing UID defaults to root
     unsafe {
         std::env::remove_var("CORTEN_DATA_DIR");
-        std::env::set_var("CORTEN_REAL_UID", "0");
+        std::env::remove_var("CORTEN_REAL_UID");
     }
-}
-
-#[test]
-fn missing_uid_env_defaults_to_root() {
-    unsafe { std::env::remove_var("CORTEN_REAL_UID"); }
     let dir = corten::config::containers_dir();
-    // Should fall back to "0" (root) which uses legacy path
-    assert!(
-        !dir.to_string_lossy().contains("users/"),
-        "Missing UID should default to root (legacy path), got: {}",
-        dir.display()
-    );
+    assert!(!dir.to_string_lossy().contains("users/"),
+        "Missing UID should default to root, got: {}", dir.display());
+
+    // Cleanup
     unsafe { std::env::set_var("CORTEN_REAL_UID", "0"); }
 }
 
