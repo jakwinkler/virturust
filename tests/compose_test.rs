@@ -118,6 +118,53 @@ fn parse_json_format() {
 }
 
 #[test]
+fn parse_jsonc_format() {
+    let mut file = tempfile::NamedTempFile::with_suffix(".jsonc").unwrap();
+    file.write_all(br#"{
+        // This is a JSONC comment
+        "services": {
+            "web": {
+                "image": "alpine", // inline comment
+                "ports": ["8080:80"]
+            },
+            /* block comment */
+            "db": {
+                "image": "alpine"
+            }
+        }
+    }"#).unwrap();
+    let forge = parse_forge_file(file.path()).unwrap();
+    assert_eq!(forge.services.len(), 2);
+    assert_eq!(forge.services["web"].ports, vec!["8080:80"]);
+}
+
+#[test]
+fn parse_example_jsonc_forge_file() {
+    let path = std::path::Path::new("examples/forge/Cortenforge.jsonc");
+    if path.exists() {
+        let forge = parse_forge_file(path).unwrap();
+        assert!(!forge.services.is_empty());
+        let order = resolve_order(&forge).unwrap();
+        assert_eq!(order.len(), forge.services.len());
+    }
+}
+
+#[test]
+fn strip_jsonc_comments() {
+    let input = r#"{
+        // line comment
+        "key": "value", // inline
+        /* block
+           comment */
+        "key2": "val//ue" // comment after string with slashes
+    }"#;
+    let stripped = corten::strip_jsonc_comments(input);
+    let parsed: serde_json::Value = serde_json::from_str(&stripped).unwrap();
+    assert_eq!(parsed["key"], "value");
+    assert_eq!(parsed["key2"], "val//ue");
+}
+
+#[test]
 fn parse_example_forge_file() {
     let path = std::path::Path::new("examples/forge/Cortenforge.toml");
     if path.exists() {

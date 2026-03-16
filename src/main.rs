@@ -488,13 +488,22 @@ async fn cmd_build(args: corten::cli::BuildArgs) -> Result<()> {
 
     let path = std::path::Path::new(&args.path);
     let toml_path = if path.is_dir() {
-        path.join("Corten.toml")
+        // Look for Corten.toml, Corten.json, or Corten.jsonc
+        if path.join("Corten.toml").exists() {
+            path.join("Corten.toml")
+        } else if path.join("Corten.jsonc").exists() {
+            path.join("Corten.jsonc")
+        } else if path.join("Corten.json").exists() {
+            path.join("Corten.json")
+        } else {
+            path.join("Corten.toml") // default, will error below
+        }
     } else {
         path.to_path_buf()
     };
 
     if !toml_path.exists() {
-        return Err(anyhow!("Corten.toml not found at {}", toml_path.display()));
+        return Err(anyhow!("Build config not found at {} (supports .toml, .json, .jsonc)", toml_path.display()));
     }
 
     let config = build::parse_build_config(&toml_path)?;

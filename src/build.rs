@@ -191,11 +191,29 @@ pub fn detect_package_manager(system: &str) -> &'static str {
 }
 
 /// Parse a Corten.toml file.
+/// Parse a build config from a file.
+///
+/// Supports three formats (auto-detected by extension):
+/// - `.toml` — TOML (default, recommended)
+/// - `.json` — JSON
+/// - `.jsonc` — JSON with Comments (VS Code style)
 pub fn parse_build_config(path: &Path) -> Result<BuildConfig> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
-    let config: BuildConfig = toml::from_str(&content)
-        .with_context(|| format!("failed to parse {}", path.display()))?;
+
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("toml");
+
+    let config: BuildConfig = match ext {
+        "json" => serde_json::from_str(&content)
+            .with_context(|| format!("failed to parse JSON: {}", path.display()))?,
+        "jsonc" => {
+            let stripped = crate::strip_jsonc_comments(&content);
+            serde_json::from_str(&stripped)
+                .with_context(|| format!("failed to parse JSONC: {}", path.display()))?
+        }
+        _ => toml::from_str(&content)
+            .with_context(|| format!("failed to parse TOML: {}", path.display()))?,
+    };
     Ok(config)
 }
 

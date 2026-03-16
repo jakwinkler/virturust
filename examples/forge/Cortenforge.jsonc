@@ -1,0 +1,48 @@
+{
+  // Full-stack example: API + Database + Worker
+  //
+  // Build images first, then:
+  //   corten forge -f Cortenforge.jsonc up
+
+  "services": {
+    // Database — starts first (no dependencies)
+    "db": {
+      "image": "alpine",
+      "command": ["sh", "-c", "echo 'DB ready' && sleep 3600"],
+      "restart": "always",
+      "memory": "256m",
+      "env": {
+        "DB_NAME": "myapp",
+        "DB_USER": "app"
+      }
+    },
+
+    // API server — depends on database
+    "api": {
+      "image": "alpine",
+      "command": ["sh", "-c", "echo 'API listening on :8000' && sleep 3600"],
+      "ports": ["8000:8000"],
+      "depends_on": ["db"],
+      "restart": "always",
+      "memory": "128m",
+      "env": {
+        "DB_HOST": "db",
+        "API_PORT": "8000"
+      }
+    },
+
+    /*
+     * Background worker
+     * Processes jobs from the queue
+     * Depends on both API and DB
+     */
+    "worker": {
+      "image": "alpine",
+      "command": ["sh", "-c", "echo 'Worker processing' && sleep 3600"],
+      "depends_on": ["api", "db"],
+      "env": {
+        "WORKER_MODE": "background"
+      }
+    }
+  }
+}

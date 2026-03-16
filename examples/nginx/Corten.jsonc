@@ -1,0 +1,32 @@
+{
+  // Nginx web server on Alpine
+  // Build:  corten build examples/nginx/Corten.jsonc
+  // Run:    corten run -p 8080:80 my-nginx
+
+  "image": {
+    "name": "my-nginx",
+    "tag": "latest"
+  },
+
+  "base": {
+    "system": "alpine",
+    "version": "3.20"
+  },
+
+  "packages": {
+    "install": ["nginx"]
+  },
+
+  "setup": {
+    "run": [
+      "mkdir -p /run/nginx /var/www/html",
+      // Custom landing page
+      "echo '<h1>Hello from Corten!</h1><p>Nginx on Alpine, no Docker.</p>' > /var/www/html/index.html"
+    ]
+  },
+
+  "container": {
+    "command": ["/bin/sh", "-c", "mkdir -p /run/nginx && exec nginx -g 'daemon off;'"],
+    "expose": [80]
+  }
+}

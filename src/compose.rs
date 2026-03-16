@@ -107,7 +107,12 @@ pub struct Service {
     pub read_only: bool,
 }
 
-/// Parse a forge file (Cortenforge.toml or .json — auto-detected by extension).
+/// Parse a forge file (auto-detected by extension).
+///
+/// Supported formats:
+/// - `.toml` — TOML (default, recommended)
+/// - `.json` — JSON
+/// - `.jsonc` — JSON with Comments
 pub fn parse_forge_file(path: &Path) -> Result<ForgeFile> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
@@ -117,6 +122,11 @@ pub fn parse_forge_file(path: &Path) -> Result<ForgeFile> {
     let forge: ForgeFile = match ext {
         "json" => serde_json::from_str(&content)
             .with_context(|| format!("failed to parse JSON: {}", path.display()))?,
+        "jsonc" => {
+            let stripped = crate::strip_jsonc_comments(&content);
+            serde_json::from_str(&stripped)
+                .with_context(|| format!("failed to parse JSONC: {}", path.display()))?
+        }
         _ => toml::from_str(&content)
             .with_context(|| format!("failed to parse TOML: {}", path.display()))?,
     };

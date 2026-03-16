@@ -39,23 +39,25 @@ check:
 ## This is a one-time sudo operation. After installation, you can run
 ## 'corten' directly without sudo — Linux capabilities grant the
 ## binary only the specific privileges it needs.
+ELEVATE := $(shell command -v sudo 2>/dev/null || command -v doas 2>/dev/null || echo "pkexec")
+
 install: build
-	@echo "=== Installing Corten ==="
+	@echo "=== Installing Corten (one-time root needed) ==="
 	@echo ""
 	@echo "1. Installing binary to $(PREFIX)/bin/$(BINARY)..."
-	sudo install -m 755 $(TARGET) $(PREFIX)/bin/$(BINARY)
+	$(ELEVATE) install -m 755 $(TARGET) $(PREFIX)/bin/$(BINARY)
 	@echo ""
-	@echo "2. Setting Linux capabilities (replaces need for sudo)..."
-	sudo setcap 'cap_sys_admin,cap_net_admin,cap_sys_chroot,cap_dac_override,cap_fowner,cap_chown,cap_setuid,cap_setgid,cap_mknod+eip' $(PREFIX)/bin/$(BINARY)
+	@echo "2. Setting Linux capabilities (no sudo needed after this)..."
+	$(ELEVATE) setcap 'cap_sys_admin,cap_net_admin,cap_sys_chroot,cap_dac_override,cap_fowner,cap_chown,cap_setuid,cap_setgid,cap_mknod+eip' $(PREFIX)/bin/$(BINARY)
 	@echo ""
 	@echo "3. Creating data directories..."
-	sudo mkdir -p /var/lib/corten/images /var/lib/corten/containers
-	sudo chown -R $$(id -u):$$(id -g) /var/lib/corten
+	$(ELEVATE) mkdir -p /var/lib/corten/images /var/lib/corten/containers
+	$(ELEVATE) chown -R $$(id -u):$$(id -g) /var/lib/corten
 	@echo ""
 	@echo "4. Setting up cgroup delegation..."
-	sudo mkdir -p /sys/fs/cgroup/corten
-	sudo chown $$(id -u):$$(id -g) /sys/fs/cgroup/corten
-	@echo "+memory +cpu +pids" | sudo tee /sys/fs/cgroup/cgroup.subtree_control > /dev/null 2>&1 || true
+	$(ELEVATE) mkdir -p /sys/fs/cgroup/corten
+	$(ELEVATE) chown $$(id -u):$$(id -g) /sys/fs/cgroup/corten
+	@echo "+memory +cpu +pids" | $(ELEVATE) tee /sys/fs/cgroup/cgroup.subtree_control > /dev/null 2>&1 || true
 	@echo ""
 	@echo "=== Installation complete! ==="
 	@echo ""
