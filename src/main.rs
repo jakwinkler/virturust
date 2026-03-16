@@ -20,8 +20,16 @@ async fn main() -> Result<()> {
 
     // Save the real user who invoked corten (before privilege elevation).
     // Used for per-user container isolation.
-    let real_uid = unsafe { libc::getuid() };
-    let real_gid = unsafe { libc::getgid() };
+    // If CORTEN_REAL_UID is already set (e.g., by tests or wrapper scripts),
+    // use that instead of the actual UID — allows testing user isolation.
+    let real_uid: u32 = std::env::var("CORTEN_REAL_UID")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| unsafe { libc::getuid() });
+    let real_gid: u32 = std::env::var("CORTEN_REAL_GID")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| unsafe { libc::getgid() });
 
     // Check if user is in the 'corten' group (or is root).
     // If the 'corten' group exists, only members can use corten.
