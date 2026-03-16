@@ -18,25 +18,14 @@ use corten::image;
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Save the real user who invoked corten (before privilege elevation).
-    // Used for per-user container isolation.
-    // If CORTEN_REAL_UID is already set (e.g., by tests or wrapper scripts),
-    // use that instead of the actual UID — allows testing user isolation.
-    let real_uid: u32 = std::env::var("CORTEN_REAL_UID")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| unsafe { libc::getuid() });
-    let real_gid: u32 = std::env::var("CORTEN_REAL_GID")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| unsafe { libc::getgid() });
+    // Get the ACTUAL invoking user (for group permission check).
+    let actual_uid = unsafe { libc::getuid() };
 
     // Check if user is in the 'corten' group (or is root).
-    // If the 'corten' group exists, only members can use corten.
-    // If it doesn't exist, anyone can use it (backwards compatible).
-    if real_uid != 0 {
+    // Uses ACTUAL uid (not overridable) for security.
+    if actual_uid != 0 {
         if let Some(required_gid) = corten_group_gid() {
-            if !user_in_group(real_uid, required_gid) {
+            if !user_in_group(actual_uid, required_gid) {
                 eprintln!("Permission denied: user is not in the 'corten' group.");
                 eprintln!("");
                 eprintln!("Add yourself:  sudo usermod -aG corten $(whoami)");
@@ -57,10 +46,14 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Store real UID for per-user container isolation
-    unsafe {
-        std::env::set_var("CORTEN_REAL_UID", real_uid.to_string());
-        std::env::set_var("CORTEN_REAL_GID", real_gid.to_string());
+    // Store real UID for per-user container isolation.
+    // If CORTEN_REAL_UID is already set (by tests or wrapper scripts), keep it.
+    // Otherwise, use the actual invoking user's UID.
+    if std::env::var("CORTEN_REAL_UID").is_err() {
+        unsafe {
+            std::env::set_var("CORTEN_REAL_UID", actual_uid.to_string());
+            std::env::set_var("CORTEN_REAL_GID", unsafe { libc::getgid() }.to_string());
+        }
     }
 
     // Configure logging — default to "info", use "debug" with --verbose
