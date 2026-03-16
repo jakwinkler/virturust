@@ -214,25 +214,23 @@ echo ""
 
 # --- Docker ---
 echo "  Benchmarking Docker Redis..."
-DOCKER_BENCH=$(redis-benchmark -h 127.0.0.1 -p $DOCKER_PORT -n $BENCH_REQUESTS -c $BENCH_CLIENTS -t set,get,incr,lpush,lrange -q 2>&1)
-echo "$DOCKER_BENCH" | while IFS= read -r line; do echo "    $line"; done
-
-DOCKER_SET=$(echo "$DOCKER_BENCH" | grep "^SET:" | awk '{print $2}')
-DOCKER_GET=$(echo "$DOCKER_BENCH" | grep "^GET:" | awk '{print $2}')
-DOCKER_INCR=$(echo "$DOCKER_BENCH" | grep "^INCR:" | awk '{print $2}')
-DOCKER_LPUSH=$(echo "$DOCKER_BENCH" | grep "^LPUSH:" | awk '{print $2}')
+DOCKER_BENCH=$(redis-benchmark -h 127.0.0.1 -p $DOCKER_PORT -n $BENCH_REQUESTS -c $BENCH_CLIENTS -t set,get,incr,lpush --csv 2>/dev/null)
+DOCKER_SET=$(echo "$DOCKER_BENCH" | grep '"SET"' | cut -d, -f2 | tr -d '"')
+DOCKER_GET=$(echo "$DOCKER_BENCH" | grep '"GET"' | cut -d, -f2 | tr -d '"')
+DOCKER_INCR=$(echo "$DOCKER_BENCH" | grep '"INCR"' | cut -d, -f2 | tr -d '"')
+DOCKER_LPUSH=$(echo "$DOCKER_BENCH" | grep '"LPUSH"' | cut -d, -f2 | tr -d '"')
+echo "    SET: ${DOCKER_SET}/s  GET: ${DOCKER_GET}/s  INCR: ${DOCKER_INCR}/s  LPUSH: ${DOCKER_LPUSH}/s"
 
 echo ""
 
 # --- Corten ---
 echo "  Benchmarking Corten Redis..."
-CORTEN_BENCH=$(redis-benchmark -h 127.0.0.1 -p $CORTEN_PORT -n $BENCH_REQUESTS -c $BENCH_CLIENTS -t set,get,incr,lpush,lrange -q 2>&1)
-echo "$CORTEN_BENCH" | while IFS= read -r line; do echo "    $line"; done
-
-CORTEN_SET=$(echo "$CORTEN_BENCH" | grep "^SET:" | awk '{print $2}')
-CORTEN_GET=$(echo "$CORTEN_BENCH" | grep "^GET:" | awk '{print $2}')
-CORTEN_INCR=$(echo "$CORTEN_BENCH" | grep "^INCR:" | awk '{print $2}')
-CORTEN_LPUSH=$(echo "$CORTEN_BENCH" | grep "^LPUSH:" | awk '{print $2}')
+CORTEN_BENCH=$(redis-benchmark -h 127.0.0.1 -p $CORTEN_PORT -n $BENCH_REQUESTS -c $BENCH_CLIENTS -t set,get,incr,lpush --csv 2>/dev/null)
+CORTEN_SET=$(echo "$CORTEN_BENCH" | grep '"SET"' | cut -d, -f2 | tr -d '"')
+CORTEN_GET=$(echo "$CORTEN_BENCH" | grep '"GET"' | cut -d, -f2 | tr -d '"')
+CORTEN_INCR=$(echo "$CORTEN_BENCH" | grep '"INCR"' | cut -d, -f2 | tr -d '"')
+CORTEN_LPUSH=$(echo "$CORTEN_BENCH" | grep '"LPUSH"' | cut -d, -f2 | tr -d '"')
+echo "    SET: ${CORTEN_SET}/s  GET: ${CORTEN_GET}/s  INCR: ${CORTEN_INCR}/s  LPUSH: ${CORTEN_LPUSH}/s"
 
 echo ""
 

@@ -104,15 +104,12 @@ install = ["postgresql16"]
 
 [setup]
 run = [
+    "rm -f /dev/null /dev/zero /dev/urandom; mknod -m 666 /dev/null c 1 3; mknod -m 666 /dev/zero c 1 5; mknod -m 666 /dev/urandom c 1 9",
     "mkdir -p /run/postgresql /var/lib/postgresql/data",
     "chown -R postgres:postgres /run/postgresql /var/lib/postgresql",
     "su postgres -c 'initdb -D /var/lib/postgresql/data'",
-    "su postgres -c 'pg_ctl start -D /var/lib/postgresql/data -l /tmp/pg.log -w'",
-    "su postgres -c 'createuser -s root'",
-    "su postgres -c 'createdb benchdb'",
-    "su postgres -c 'pg_ctl stop -D /var/lib/postgresql/data -w'",
     "echo 'host all all 0.0.0.0/0 trust' >> /var/lib/postgresql/data/pg_hba.conf",
-    "sed -i \"s/#listen_addresses = 'localhost'/listen_addresses = '*'/\" /var/lib/postgresql/data/postgresql.conf",
+    "echo \"listen_addresses = '*'\" >> /var/lib/postgresql/data/postgresql.conf",
 ]
 
 [container]
@@ -152,14 +149,24 @@ DOCKER_OK=false
 CORTEN_OK=false
 for i in $(seq 1 30); do
     if ! $DOCKER_OK; then
-        pgbench -h 127.0.0.1 -p $DOCKER_PORT -U postgres -i benchdb >/dev/null 2>&1 && DOCKER_OK=true
+        psql -h 127.0.0.1 -p $DOCKER_PORT -U postgres -c "SELECT 1" >/dev/null 2>&1 && DOCKER_OK=true
     fi
     if ! $CORTEN_OK; then
-        pgbench -h 127.0.0.1 -p $CORTEN_PORT -U postgres -i benchdb >/dev/null 2>&1 && CORTEN_OK=true
+        psql -h 127.0.0.1 -p $CORTEN_PORT -U postgres -c "SELECT 1" >/dev/null 2>&1 && CORTEN_OK=true
     fi
     $DOCKER_OK && $CORTEN_OK && break
     sleep 1
 done
+
+# Create benchmark databases
+if $DOCKER_OK; then
+    psql -h 127.0.0.1 -p $DOCKER_PORT -U postgres -c "CREATE DATABASE benchdb" >/dev/null 2>&1 || true
+    pgbench -h 127.0.0.1 -p $DOCKER_PORT -U postgres -i benchdb >/dev/null 2>&1
+fi
+if $CORTEN_OK; then
+    psql -h 127.0.0.1 -p $CORTEN_PORT -U postgres -c "CREATE DATABASE benchdb" >/dev/null 2>&1 || true
+    pgbench -h 127.0.0.1 -p $CORTEN_PORT -U postgres -i benchdb >/dev/null 2>&1
+fi
 
 echo -n "  Docker: "
 if $DOCKER_OK; then
